@@ -27,7 +27,12 @@ public protocol BlockListStorageProvider: Sendable {
 public enum ConnectionPoolConfiguration {
     /// Logger instance injected by the host app.
     /// Set this before any ConnectionPool APIs are used.
-    nonisolated(unsafe) public static var logger: ConnectionPoolLogger?
+    private static let _loggerLock = NSLock()
+    nonisolated(unsafe) private static var _logger: ConnectionPoolLogger?
+    public static var logger: ConnectionPoolLogger? {
+        get { _loggerLock.withLock { _logger } }
+        set { _loggerLock.withLock { _logger = newValue } }
+    }
 
     /// Optional secure storage provider for the device block list.
     ///

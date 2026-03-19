@@ -94,6 +94,9 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Block list service for persistent device blocking
     private let blockListService = DeviceBlockListService.shared
 
+    /// Tracked delayed tasks so they can be cancelled on disconnect
+    private var delayedTasks: [Task<Void, Never>] = []
+
     /// Per-peer cooldown: tracks the last connection attempt timestamp per peer display name.
     /// Used to rate-limit invitation processing (5-second cooldown between attempts).
     private var lastAttemptTime: [String: Date] = [:]
@@ -389,12 +392,13 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         // This allows peers that are out of the host's direct range but within range
         // of other connected peers to discover the pool. The relay advertiser uses a
         // separate service type and MCSession to avoid DTLS conflicts.
-        Task { @MainActor in
+        let relayTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(1000))
             if self.poolState == .hosting {
                 self.startRelayAdvertising()
             }
         }
+        delayedTasks.append(relayTask)
     }
 
     /// Start browsing for available pools
@@ -758,6 +762,10 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         session?.disconnect()
         session = nil
 
+        // Cancel all pending delayed tasks
+        delayedTasks.forEach { $0.cancel() }
+        delayedTasks.removeAll()
+
         // Clear state
         connectedPeers = []
         discoveredPeers = []
@@ -997,7 +1005,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         // The DTLS handshake involves multiple round-trips and internal state updates.
         let targetPeerID = peerIDString
         let connectTime = Date()
-        Task { @MainActor in
+        let profileTask = Task { @MainActor in
             log("[CALLER_TRACE] addConnectedPeer: starting 2500ms delay for profile update to \(targetPeerID) (connected at \(connectTime))", category: .network)
             try? await Task.sleep(for: .milliseconds(2500))
             // Verify peer is still connected before sending
@@ -1018,6 +1026,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
                 log("Sent delayed profile update to \(targetPeerID)", level: .debug, category: .network)
             }
         }
+        delayedTasks.append(profileTask)
 
         // Publish event
         peerEvent.send(.connected(peer))
@@ -1111,7 +1120,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         // Send our profile to the relay peer after DTLS stabilization
         let connectTime = Date()
-        Task { @MainActor in
+        let relayProfileTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(2500))
             guard self.relayConnectedPeerIDs.contains(peerIDString) else { return }
             let elapsed = Date().timeIntervalSince(connectTime)
@@ -1125,6 +1134,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
                 self.sendMessage(message, to: [peerIDString])
             }
         }
+        delayedTasks.append(relayProfileTask)
     }
 
     /// Called when a peer disconnects from the relay session
@@ -1257,12 +1267,13 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         // Start relay advertising after delay (extending discovery range further)
         if !isHost {
-            Task { @MainActor in
+            let relayAdvTask = Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(3000))
                 if self.poolState == .connected && !self.isHost {
                     self.startRelayAdvertising()
                 }
             }
+            delayedTasks.append(relayAdvTask)
         }
     }
 
@@ -1409,13 +1420,14 @@ extension ConnectionPoolManager: MCSessionDelegate {
                     // Delay relay advertising to ensure MultipeerConnectivity internal state
                     // is fully stabilized after connection (fixes "Not in connected state" errors)
                     if !isHost {
-                        Task { @MainActor in
+                        let delayedRelayTask = Task { @MainActor in
                             try? await Task.sleep(for: .milliseconds(3000))
                             // Re-check conditions after delay since state may have changed
                             if poolState == .connected && !isHost {
                                 startRelayAdvertising()
                             }
                         }
+                        delayedTasks.append(delayedRelayTask)
                     }
                 }
 

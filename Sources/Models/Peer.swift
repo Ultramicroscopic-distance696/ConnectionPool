@@ -58,38 +58,26 @@ public struct PoolUserProfile: Codable, Sendable, Equatable {
     /// Cached device name to avoid blocking DNS lookups.
     /// `Host.current().localizedName` performs a synchronous reverse DNS lookup
     /// that can block for 5-6 seconds if DNS is slow or fails.
-    /// We cache the result on first access to prevent repeated blocking calls.
+    /// Computed once via `static let` which is thread-safe by Swift guarantee.
     ///
     /// NOTE: On iOS, UIDevice.current.name requires main actor access in Swift 6.
     /// On macOS, ProcessInfo.hostName is nonisolated and fast.
-    /// We use nonisolated(unsafe) to allow static initialization since the device
-    /// name is constant throughout app lifetime.
-    nonisolated(unsafe) private static var _cachedDeviceName: String?
-
-    /// Get device name, caching on first access
-    private static func getDeviceName() -> String {
-        if let cached = _cachedDeviceName {
-            return cached
-        }
+    private static let _cachedDeviceName: String = {
         #if canImport(UIKit)
-        // On iOS, use a generic fallback for static initialization
-        // The actual device name will be used when profile is loaded from storage
-        let name = "iOS User"
+        return "iOS User"
         #else
-        // Use ProcessInfo.processInfo.hostName as primary source - it's faster
-        // and doesn't do reverse DNS lookup. Fall back to Host.current() only
-        // if needed, but prefer the fast path.
         let hostName = ProcessInfo.processInfo.hostName
-        let name: String
         if !hostName.isEmpty && hostName != "localhost" {
-            name = hostName
+            return hostName
         } else {
-            // Last resort: use Host.current() which may block on DNS
-            name = Host.current().localizedName ?? "Mac User"
+            return Host.current().localizedName ?? "Mac User"
         }
         #endif
-        _cachedDeviceName = name
-        return name
+    }()
+
+    /// Get device name (cached, thread-safe)
+    private static func getDeviceName() -> String {
+        return _cachedDeviceName
     }
 
     /// Default profile using device name

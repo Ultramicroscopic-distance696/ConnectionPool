@@ -36,18 +36,6 @@ public final class MeshTopology: @unchecked Sendable {
     /// Stale peer threshold in seconds (peers not heard from in this time are considered stale)
     private let staleThreshold: TimeInterval = 60.0
     
-    // MARK: - Thread-Safe Accessors
-    
-    private var neighborMap: [String: Set<String>] {
-        get { lock.withLock { _neighborMap } }
-        set { lock.withLock { _neighborMap = newValue } }
-    }
-    
-    private var lastHeard: [String: Date] {
-        get { lock.withLock { _lastHeard } }
-        set { lock.withLock { _lastHeard = newValue } }
-    }
-    
     // MARK: - Initialization
     
     /// Creates a new mesh topology tracker.

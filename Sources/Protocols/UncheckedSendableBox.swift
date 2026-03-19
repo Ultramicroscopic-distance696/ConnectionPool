@@ -19,6 +19,10 @@ import Foundation
 /// - The wrapped value is accessed from a single actor/thread
 /// - The value is read-only after crossing the boundary
 /// - The value's type is inherently thread-safe but not marked Sendable
+///
+/// WARNING: This type deliberately bypasses Sendable checking. The caller MUST ensure
+/// the wrapped value is either immutable after creation or only accessed from one
+/// isolation domain. Wrapping a mutable, shared value is undefined behavior.
 public struct UncheckedSendableBox<T>: @unchecked Sendable {
     public let value: T
 
