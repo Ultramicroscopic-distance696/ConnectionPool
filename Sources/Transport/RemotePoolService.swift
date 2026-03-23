@@ -325,15 +325,15 @@ public final class RemotePoolService: ObservableObject {
 
         // Construct server URL from the addr field.
         // The server embeds its bind address (e.g., "0.0.0.0:9090") which isn't
-        // directly reachable. Use ws:// (not wss://) for IP:port addresses.
+        // directly reachable. Default to wss:// for raw address:port to ensure encryption.
         let serverAddress = wire.addr
         let serverURL: URL
         if serverAddress.hasPrefix("wss://") || serverAddress.hasPrefix("ws://") {
             guard let url = URL(string: serverAddress) else { return nil }
             serverURL = url
         } else {
-            // Default to ws:// for raw address:port
-            guard let url = URL(string: "ws://\(serverAddress)") else { return nil }
+            // Default to wss:// for raw address:port (encrypted by default)
+            guard let url = URL(string: "wss://\(serverAddress)") else { return nil }
             serverURL = url
         }
 

@@ -54,6 +54,14 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
     @Published public var showClaimCodeInput: Bool = false
     @Published public var isClaimingServer: Bool = false
     @Published public var serverClaimed: Bool = false
+    @Published public var serverRecoveryKey: String?
+    @Published public var showRecoveryKeySheet: Bool = false
+    @Published public var recoveryKeySavedToPasswordManager: Bool = false
+
+    /// Callback for saving the recovery key to the password manager.
+    /// The host app should set this to wire into PasswordManager.
+    /// Parameters: (name: String, key: String, serverURL: String) async -> Bool
+    public var onSaveToPasswordManager: (@MainActor (String, String, String) async -> Bool)?
 
     /// Remote pool state
     @Published public var transportMode: TransportMode = .local
@@ -611,17 +619,14 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
             return
         }
 
-        // Normalize the URL: add ws:// scheme if missing.
-        // Use ws:// for local/IP connections, wss:// for domain names.
+        // Normalize the URL: add wss:// scheme if missing.
+        // Default to wss:// for all connections to ensure encryption.
         let normalized: String
         if trimmed.hasPrefix("wss://") || trimmed.hasPrefix("ws://") {
             normalized = trimmed
-        } else if trimmed.contains(".") && !trimmed.contains(":") {
-            // Looks like a domain name without port — use wss://
-            normalized = "wss://\(trimmed)"
         } else {
-            // IP address or IP:port — use plain ws://
-            normalized = "ws://\(trimmed)"
+            // Default to wss:// for all raw addresses (encrypted by default)
+            normalized = "wss://\(trimmed)"
         }
 
         guard let url = URL(string: normalized) else {
@@ -708,6 +713,29 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
         // If we already have a transport connected and waiting for claim, submit automatically
         if showClaimCodeInput, webSocketTransport != nil {
             submitClaimCode()
+        }
+    }
+
+    /// Called when the user has saved the recovery key and is ready to proceed.
+    public func acknowledgeRecoveryKey() {
+        showRecoveryKeySheet = false
+        proceedAfterClaim()
+    }
+
+    /// Continue to HostAuth after claim success (and optional recovery key acknowledgment).
+    private func proceedAfterClaim() {
+        if let wsTransport = webSocketTransport, let poolID = remotePoolID {
+            let name = poolName.isEmpty ? "\(poolManager.localProfile.displayName)'s Pool" : poolName
+            let poolInfo = PoolAdvertisementInfo(
+                poolID: poolID,
+                poolName: name,
+                hostName: poolManager.localProfile.displayName,
+                hasPoolCode: false,
+                maxPeers: maxPeers,
+                hostProfile: poolManager.localProfile
+            )
+            wsTransport.sendHostAuthAfterClaim(poolInfo: poolInfo)
+            log("Claim succeeded, proceeding to HostAuth", category: .network)
         }
     }
 
@@ -891,6 +919,29 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
                 poolManager.updatePeerProfile(peerID: payload.peerID, profile: payload.profile)
             }
 
+        case .peerInfo:
+            // HOST ROSTER: The host broadcasts PeerInfoPayload messages so that members
+            // learn about other members they are not directly connected to via MC.
+            // This enables key exchange and encrypted chat between non-adjacent peers
+            // in the hub-and-spoke MultipeerConnectivity topology.
+            if let payload = message.decodePayload(as: PeerInfoPayload.self) {
+                let remotePeerID = payload.peerID
+                // Don't add ourselves
+                guard remotePeerID != poolManager.localPeerID else { break }
+                // Don't duplicate
+                guard !poolManager.connectedPeers.contains(where: { $0.id == remotePeerID }) else { break }
+
+                let newPeer = Peer(
+                    id: remotePeerID,
+                    displayName: payload.profile?.displayName ?? payload.displayName,
+                    isHost: payload.isHost,
+                    status: .connected,
+                    profile: payload.profile
+                )
+                poolManager.addRemotePeer(newPeer)
+                log("[HOST_ROSTER] Added remote peer from host roster: \(remotePeerID.prefix(8))...", category: .network)
+            }
+
         default:
             // Handle other message types (game states, etc.)
             break
@@ -989,7 +1040,7 @@ extension ConnectionPoolViewModel: TransportDelegate {
             poolState = .hosting
             currentView = .lobby
             // Bridge remote state into ConnectionPoolManager so games/chat detect the pool
-            if transportMode == .remote, let ws = webSocketTransport, let poolID = remotePoolID {
+            if transportMode == .remote, let ws = webSocketTransport, remotePoolID != nil {
                 poolManager.remoteTransport = ws
                 poolManager.remotePeerID = ws.localPeerID
                 let session = PoolSession(
@@ -1031,6 +1082,10 @@ extension ConnectionPoolViewModel: TransportDelegate {
             isConnectingRemote = false
             showError(message: error.localizedDescription)
             poolState = .error(error.localizedDescription)
+            // Clear remote transport bridge so a subsequent local session
+            // does not route messages through the failed WebSocket.
+            poolManager.remoteTransport = nil
+            poolManager.remotePeerID = nil
         case .reconnecting:
             break
         case .idle:
@@ -1039,20 +1094,13 @@ extension ConnectionPoolViewModel: TransportDelegate {
                 isClaimingServer = false
                 serverClaimed = true
                 showClaimCodeInput = false
+                serverRecoveryKey = webSocketTransport?.lastClaimSuccess?.recoveryKey
 
-                // Automatically proceed with HostAuth on the existing connection.
-                if let wsTransport = webSocketTransport, let poolID = remotePoolID {
-                    let name = poolName.isEmpty ? "\(poolManager.localProfile.displayName)'s Pool" : poolName
-                    let poolInfo = PoolAdvertisementInfo(
-                        poolID: poolID,
-                        poolName: name,
-                        hostName: poolManager.localProfile.displayName,
-                        hasPoolCode: false,
-                        maxPeers: maxPeers,
-                        hostProfile: poolManager.localProfile
-                    )
-                    wsTransport.sendHostAuthAfterClaim(poolInfo: poolInfo)
-                    log("Claim succeeded, proceeding to HostAuth", category: .network)
+                // Show recovery key to user — HostAuth proceeds after acknowledgment.
+                if serverRecoveryKey != nil {
+                    showRecoveryKeySheet = true
+                } else {
+                    proceedAfterClaim()
                 }
             }
         case .discovering:

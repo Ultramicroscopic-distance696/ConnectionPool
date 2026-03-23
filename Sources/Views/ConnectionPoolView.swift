@@ -2139,195 +2139,107 @@ private struct RemoteHostSheet: View {
     @ObservedObject var viewModel: ConnectionPoolViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var serverURLInput: String = ""
-    @State private var showQRScanner: Bool = false
-
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 24) {
-                    // Header
-                    VStack(spacing: 12) {
-                        ZStack {
-                            Circle()
-                                .fill(Color.purple.opacity(0.15))
-                                .frame(width: 80, height: 80)
+        NavigationView {
+            Group {
+                if viewModel.showClaimCodeInput {
+                    RemoteHostClaimView(viewModel: viewModel, dismiss: dismiss)
+                } else {
+                    ScrollView {
+                        VStack(spacing: 24) {
+                            // Header
+                            VStack(spacing: 12) {
+                                ZStack {
+                                    Circle()
+                                        .fill(Color.purple.opacity(0.15))
+                                        .frame(width: 80, height: 80)
 
-                            Image(systemName: "server.rack")
-                                .font(.system(size: 36))
-                                .foregroundStyle(.purple)
-                        }
+                                    Image(systemName: "server.rack")
+                                        .font(.system(size: 36))
+                                        .foregroundStyle(.purple)
+                                }
 
-                        Text("Host Remote Pool")
-                            .font(.title2.bold())
+                                Text("Host Remote Pool")
+                                    .font(.title2.bold())
 
-                        Text("Create a pool that anyone can join\nvia invitation link, from anywhere.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .padding(.top)
-
-                    // Server URL
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Server URL")
-                            .font(.headline)
-
-                        TextField("10.0.0.4:9090 or relay.example.com", text: $serverURLInput)
-                            .textFieldStyle(.roundedBorder)
-                            .autocorrectionDisabled()
-                            .crossPlatformTextField()
-
-                        Text("IP:port for local, domain for internet (via cloudflared)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    // Pool Name
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Pool Name")
-                            .font(.headline)
-
-                        TextField("Enter pool name", text: $viewModel.poolName)
-                            .textFieldStyle(.roundedBorder)
-                    }
-
-                    // Max Members
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Max Members")
-                            .font(.headline)
-
-                        Picker("Max Members", selection: $viewModel.maxPeers) {
-                            ForEach([2, 4, 6, 8, 10, 12, 16], id: \.self) { count in
-                                Text("\(count) members").tag(count)
+                                Text("Create a pool that anyone can join\nvia invitation link, from anywhere.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.center)
                             }
-                        }
-                        .pickerStyle(.segmented)
+                            .padding(.top)
 
-                        Text("Maximum number of peers that can join this pool")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                            // Server URL
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Server URL")
+                                    .font(.headline)
 
-                    // Server Claim Section (shown when server is unclaimed)
-                    if viewModel.showClaimCodeInput {
-                        VStack(spacing: 12) {
-                            Image(systemName: "lock.shield")
-                                .font(.system(size: 40))
-                                .foregroundStyle(.orange)
+                                TextField("10.0.0.4:9090 or relay.example.com", text: $serverURLInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .autocorrectionDisabled()
+                                    .crossPlatformTextField()
 
-                            Text("Server Claim Required")
-                                .font(.headline)
+                                Text("IP:port for local, domain for internet (via cloudflared)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
 
-                            Text("Scan the QR code or enter the claim code from your server's Docker logs.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
+                            // Pool Name
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Pool Name")
+                                    .font(.headline)
 
-                            #if os(iOS)
+                                TextField("Enter pool name", text: $viewModel.poolName)
+                                    .textFieldStyle(.roundedBorder)
+                            }
+
+                            // Max Members
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Max Members")
+                                    .font(.headline)
+
+                                Picker("Max Members", selection: $viewModel.maxPeers) {
+                                    ForEach([2, 4, 6, 8, 10, 12, 16], id: \.self) { count in
+                                        Text("\(count) members").tag(count)
+                                    }
+                                }
+                                .pickerStyle(.segmented)
+
+                                Text("Maximum number of peers that can join this pool")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer(minLength: 20)
+
+                            // Create Button
                             Button {
-                                showQRScanner = true
+                                viewModel.createRemotePool(serverURL: serverURLInput)
                             } label: {
                                 HStack {
-                                    Image(systemName: "qrcode.viewfinder")
-                                    Text("Scan QR Code")
+                                    if viewModel.isConnectingRemote {
+                                        ProgressView()
+                                            .tint(.white)
+                                    } else {
+                                        Image(systemName: "antenna.radiowaves.left.and.right")
+                                    }
+                                    Text(viewModel.isConnectingRemote ? "Connecting..." : "Create Remote Pool")
                                 }
                                 .font(.headline)
                                 .frame(maxWidth: .infinity)
                                 .padding()
+                                .background(serverURLInput.isEmpty || viewModel.isConnectingRemote ? Color.gray : Color.purple)
+                                .foregroundStyle(.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
                             }
-                            .background(Color.orange.opacity(0.15))
-                            .foregroundStyle(.orange)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            #endif
-
-                            HStack {
-                                Rectangle()
-                                    .fill(Color.secondary.opacity(0.3))
-                                    .frame(height: 1)
-                                Text("or enter manually")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                Rectangle()
-                                    .fill(Color.secondary.opacity(0.3))
-                                    .frame(height: 1)
-                            }
-
-                            TextField("XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX", text: $viewModel.claimCode)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.system(.body, design: .monospaced))
-                                .autocorrectionDisabled()
-                                #if os(iOS)
-                                .textInputAutocapitalization(.characters)
-                                #endif
-
-                            Button(action: { viewModel.submitClaimCode() }) {
-                                if viewModel.isClaimingServer {
-                                    ProgressView()
-                                        .frame(maxWidth: .infinity)
-                                        .padding()
-                                } else {
-                                    HStack {
-                                        Image(systemName: "key.fill")
-                                        Text("Claim Server")
-                                    }
-                                    .font(.headline)
-                                    .frame(maxWidth: .infinity)
-                                    .padding()
-                                }
-                            }
-                            .background(viewModel.claimCode.isEmpty || viewModel.isClaimingServer ? Color.gray : Color.orange)
-                            .foregroundStyle(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .disabled(viewModel.claimCode.isEmpty || viewModel.isClaimingServer)
+                            .disabled(serverURLInput.isEmpty || viewModel.isConnectingRemote)
                         }
                         .padding()
-                        .background(Color.orange.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
                     }
-
-                    // Server claimed confirmation
-                    if viewModel.serverClaimed {
-                        HStack(spacing: 8) {
-                            Image(systemName: "checkmark.seal.fill")
-                                .foregroundStyle(.green)
-                            Text("Server claimed successfully")
-                                .font(.subheadline)
-                                .foregroundStyle(.green)
-                        }
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.green.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                    }
-
-                    Spacer(minLength: 20)
-
-                    // Create Button (hidden when claim input is shown but not yet claimed)
-                    if !viewModel.showClaimCodeInput {
-                        Button {
-                            viewModel.createRemotePool(serverURL: serverURLInput)
-                            // Don't dismiss — wait for connection result.
-                            // If server is unclaimed, showClaimCodeInput becomes true
-                            // and the claim UI appears in this same sheet.
-                        } label: {
-                            HStack {
-                                Image(systemName: "antenna.radiowaves.left.and.right")
-                                Text("Create Remote Pool")
-                            }
-                            .font(.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(serverURLInput.isEmpty ? Color.gray : Color.purple)
-                            .foregroundStyle(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                        }
-                        .disabled(serverURLInput.isEmpty)
-                    }
+                    .navigationTitle("")
+                    .crossPlatformInlineNavigationTitle()
                 }
-                .padding()
             }
-            .navigationTitle("")
-            .crossPlatformInlineNavigationTitle()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
@@ -2339,15 +2251,270 @@ private struct RemoteHostSheet: View {
                     }
                 }
             }
-            .sheet(isPresented: $showQRScanner) {
-                ClaimScannerSheet(
-                    scannedCode: $viewModel.claimCode,
-                    isPresented: $showQRScanner,
-                    onScanned: {
-                        viewModel.handleClaimDeepLink(viewModel.claimCode)
-                    }
-                )
+            .sheet(isPresented: $viewModel.showRecoveryKeySheet) {
+                RecoveryKeySheet(viewModel: viewModel)
             }
+        }
+    }
+}
+
+// MARK: - Remote Host Claim View (Step 2)
+
+private struct RemoteHostClaimView: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+    let dismiss: DismissAction
+    @State private var showQRScanner: Bool = false
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                // Header
+                VStack(spacing: 12) {
+                    Image(systemName: "lock.shield")
+                        .font(.system(size: 50))
+                        .foregroundStyle(.orange)
+
+                    Text("Server Claim Required")
+                        .font(.title2.bold())
+
+                    Text("Scan the QR code or enter the claim code\nfrom your server's Docker logs.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.top)
+
+                // QR Scanner Button
+                #if os(iOS)
+                Button {
+                    showQRScanner = true
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "qrcode.viewfinder")
+                            .font(.system(size: 24))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Scan QR Code")
+                                .font(.headline)
+                            Text("Point camera at your server's terminal")
+                                .font(.caption)
+                                .foregroundStyle(.orange.opacity(0.8))
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .foregroundStyle(.orange.opacity(0.5))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                }
+                .background(Color.orange.opacity(0.12))
+                .foregroundStyle(.orange)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .padding(.horizontal)
+                #endif
+
+                // Divider
+                HStack {
+                    Rectangle()
+                        .fill(Color.secondary.opacity(0.3))
+                        .frame(height: 1)
+                    Text("or enter manually")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Rectangle()
+                        .fill(Color.secondary.opacity(0.3))
+                        .frame(height: 1)
+                }
+                .padding(.horizontal)
+
+                // Manual Entry
+                VStack(spacing: 16) {
+                    TextField("XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX", text: $viewModel.claimCode)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.characters)
+                        #endif
+
+                    Button(action: { viewModel.submitClaimCode() }) {
+                        if viewModel.isClaimingServer {
+                            ProgressView()
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                        } else {
+                            HStack {
+                                Image(systemName: "key.fill")
+                                Text("Claim Server")
+                            }
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                        }
+                    }
+                    .background(viewModel.claimCode.isEmpty || viewModel.isClaimingServer ? Color.gray : Color.orange)
+                    .foregroundStyle(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .disabled(viewModel.claimCode.isEmpty || viewModel.isClaimingServer)
+                }
+                .padding(.horizontal)
+
+                // Server claimed confirmation
+                if viewModel.serverClaimed {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.seal.fill")
+                            .foregroundStyle(.green)
+                        Text("Server claimed successfully")
+                            .font(.subheadline)
+                            .foregroundStyle(.green)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity)
+                    .background(Color.green.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal)
+                }
+            }
+        }
+        .navigationTitle("Claim Server")
+        .crossPlatformInlineNavigationTitle()
+        .navigationBarBackButtonHidden(viewModel.isClaimingServer)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                if viewModel.isClaimingServer {
+                    EmptyView()
+                }
+            }
+        }
+        .sheet(isPresented: $showQRScanner) {
+            ClaimScannerSheet(
+                scannedCode: $viewModel.claimCode,
+                isPresented: $showQRScanner,
+                onScanned: {
+                    viewModel.handleClaimDeepLink(viewModel.claimCode)
+                }
+            )
+        }
+    }
+}
+
+// MARK: - Recovery Key Sheet
+
+private struct RecoveryKeySheet: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+    @State private var hasCopied = false
+    @State private var isSavingToPasswordManager = false
+
+    private var hasSaved: Bool {
+        hasCopied || viewModel.recoveryKeySavedToPasswordManager
+    }
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 20) {
+                Image(systemName: "key.fill")
+                    .font(.system(size: 50))
+                    .foregroundStyle(.orange)
+
+                Text("Save Your Recovery Key")
+                    .font(.title2.bold())
+
+                Text("This key is the only way to reclaim your server if the binding is lost. It will not be shown again.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
+                if let key = viewModel.serverRecoveryKey {
+                    Text(key)
+                        .font(.system(.caption, design: .monospaced))
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.secondary.opacity(0.15))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .textSelection(.enabled)
+                        .padding(.horizontal)
+
+                    // Save to Password Manager
+                    if viewModel.onSaveToPasswordManager != nil {
+                        Button {
+                            isSavingToPasswordManager = true
+                            Task {
+                                let serverURL = viewModel.serverURL
+                                let saved = await viewModel.onSaveToPasswordManager?(
+                                    "StealthRelay Recovery Key",
+                                    key,
+                                    serverURL
+                                ) ?? false
+                                isSavingToPasswordManager = false
+                                if saved {
+                                    viewModel.recoveryKeySavedToPasswordManager = true
+                                }
+                            }
+                        } label: {
+                            HStack {
+                                if isSavingToPasswordManager {
+                                    ProgressView()
+                                        .tint(.white)
+                                } else {
+                                    Image(systemName: viewModel.recoveryKeySavedToPasswordManager
+                                          ? "checkmark.shield.fill" : "lock.shield")
+                                    Text(viewModel.recoveryKeySavedToPasswordManager
+                                         ? "Saved to Password Manager" : "Save to Password Manager")
+                                }
+                            }
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                        }
+                        .background(viewModel.recoveryKeySavedToPasswordManager
+                                    ? Color.green : Color.orange)
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .disabled(isSavingToPasswordManager || viewModel.recoveryKeySavedToPasswordManager)
+                        .padding(.horizontal)
+                    }
+
+                    // Copy to Clipboard
+                    Button {
+                        #if canImport(UIKit)
+                        UIPasteboard.general.string = key
+                        #endif
+                        hasCopied = true
+                    } label: {
+                        HStack {
+                            Image(systemName: hasCopied ? "checkmark" : "doc.on.doc")
+                            Text(hasCopied ? "Copied" : "Copy to Clipboard")
+                        }
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                    }
+                    .background(Color.orange.opacity(0.15))
+                    .foregroundStyle(.orange)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal)
+                }
+
+                Spacer()
+
+                Button {
+                    viewModel.acknowledgeRecoveryKey()
+                } label: {
+                    Text("I've Saved My Recovery Key")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                }
+                .background(hasSaved ? Color.orange : Color.gray)
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .disabled(!hasSaved)
+                .padding(.horizontal)
+                .padding(.bottom)
+            }
+            .padding(.top, 30)
+            .crossPlatformInlineNavigationTitle()
+            .interactiveDismissDisabled()
         }
     }
 }

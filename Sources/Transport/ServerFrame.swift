@@ -57,6 +57,9 @@ public enum ServerFrame: Sendable, Equatable {
 
     // MARK: - Server -> Client
 
+    /// Per-connection auth challenge containing a one-time nonce for replay protection.
+    case authChallenge(AuthChallengeData)
+
     /// Server hello with optional proof-of-work challenge.
     case serverHello(ServerHelloData)
 
@@ -113,7 +116,7 @@ public struct HostAuthData: Codable, Sendable, Equatable {
     /// Unix timestamp (seconds) when the auth was created.
     public let timestamp: Int64
 
-    /// Base64-encoded Ed25519 signature over `pool_id || timestamp`.
+    /// Base64-encoded Ed25519 signature over `pool_id || timestamp || nonce`.
     public let signature: String
 
     /// The pool identifier to authenticate for.
@@ -126,13 +129,19 @@ public struct HostAuthData: Codable, Sendable, Equatable {
     /// The host's display name shown to other pool members.
     public let displayName: String?
 
-    public init(hostPublicKey: String, timestamp: Int64, signature: String, poolId: UUID, serverUrl: String? = nil, displayName: String? = nil) {
+    /// Server-issued per-connection nonce for replay protection.
+    /// The nonce bytes are appended to the signature transcript to bind the
+    /// auth to this specific WebSocket connection and prevent replay attacks.
+    public let nonce: String
+
+    public init(hostPublicKey: String, timestamp: Int64, signature: String, poolId: UUID, serverUrl: String? = nil, displayName: String? = nil, nonce: String) {
         self.hostPublicKey = hostPublicKey
         self.timestamp = timestamp
         self.signature = signature
         self.poolId = poolId
         self.serverUrl = serverUrl
         self.displayName = displayName
+        self.nonce = nonce
     }
 
     enum CodingKeys: String, CodingKey {
@@ -142,6 +151,7 @@ public struct HostAuthData: Codable, Sendable, Equatable {
         case poolId = "pool_id"
         case serverUrl = "server_url"
         case displayName = "display_name"
+        case nonce
     }
 }
 
@@ -377,6 +387,18 @@ public struct HeartbeatPingData: Codable, Sendable, Equatable {
 
     public init(timestamp: Int64) {
         self.timestamp = timestamp
+    }
+}
+
+/// Auth challenge payload sent by the server immediately after WebSocket connection.
+/// Contains a one-time nonce that the client MUST include in its HostAuth signature
+/// transcript to bind the auth to this specific connection and prevent replay attacks.
+public struct AuthChallengeData: Codable, Sendable, Equatable {
+    /// Base64-encoded 32-byte random nonce.
+    public let nonce: String
+
+    public init(nonce: String) {
+        self.nonce = nonce
     }
 }
 
@@ -688,14 +710,20 @@ public struct ClaimSuccessData: Codable, Sendable, Equatable {
     /// Human-readable success message from the server.
     public let message: String
 
-    public init(serverFingerprint: String, message: String) {
+    /// The recovery key for reclaiming the server if the binding is lost.
+    /// This is only returned once — the user must save it.
+    public let recoveryKey: String
+
+    public init(serverFingerprint: String, message: String, recoveryKey: String) {
         self.serverFingerprint = serverFingerprint
         self.message = message
+        self.recoveryKey = recoveryKey
     }
 
     enum CodingKeys: String, CodingKey {
         case serverFingerprint = "server_fingerprint"
         case message
+        case recoveryKey = "recovery_key"
     }
 }
 
@@ -824,6 +852,7 @@ extension ServerFrame: Codable {
         case handshakeInit = "handshake_init"
         case heartbeatPing = "heartbeat_ping"
         case claimServer = "claim_server"
+        case authChallenge = "auth_challenge"
         case serverHello = "server_hello"
         case hostAuthSuccess = "host_auth_success"
         case joinAccepted = "join_accepted"
@@ -875,6 +904,8 @@ extension ServerFrame: Codable {
             self = .heartbeatPing(try container.decode(HeartbeatPingData.self, forKey: .data))
         case .claimServer:
             self = .claimServer(try container.decode(ClaimServerData.self, forKey: .data))
+        case .authChallenge:
+            self = .authChallenge(try container.decode(AuthChallengeData.self, forKey: .data))
         case .serverHello:
             self = .serverHello(try container.decode(ServerHelloData.self, forKey: .data))
         case .hostAuthSuccess:
@@ -949,6 +980,9 @@ extension ServerFrame: Codable {
             try container.encode(data, forKey: .data)
         case .claimServer(let data):
             try container.encode(FrameType.claimServer, forKey: .frameType)
+            try container.encode(data, forKey: .data)
+        case .authChallenge(let data):
+            try container.encode(FrameType.authChallenge, forKey: .frameType)
             try container.encode(data, forKey: .data)
         case .serverHello(let data):
             try container.encode(FrameType.serverHello, forKey: .frameType)

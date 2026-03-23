@@ -105,7 +105,14 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// The delegate that receives transport lifecycle and data events.
     public weak var delegate: (any TransportDelegate)?
 
+    /// The last claim success data received from the server.
+    /// Contains the recovery key that the user must save.
+    public private(set) var lastClaimSuccess: ClaimSuccessData?
+
     // MARK: - Configuration
+
+    /// Maximum allowed WebSocket frame size (1 MB). Frames exceeding this are dropped.
+    private static let maxWebSocketFrameSize = 1 * 1024 * 1024
 
     /// The remote pool configuration.
     private let configuration: RemotePoolConfiguration
@@ -170,6 +177,87 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
 
     /// The role of this transport (host or client) for reconnection context.
     private var isHostRole: Bool = false
+
+    /// Whether the server reported it is unclaimed. Suppresses HostAuth retries
+    /// and keeps the connection alive for the claim flow.
+    private var serverIsUnclaimed: Bool = false
+
+    // MARK: - Auth Challenge (SECURITY: H-3 replay protection)
+
+    /// Server-issued per-connection nonce received via `AuthChallenge`.
+    /// Included in the `HostAuth` signature transcript to bind the auth
+    /// to this specific WebSocket connection and prevent replay attacks.
+    private var authChallengeNonce: String?
+
+    /// Pool info for a pending `HostAuth` that is waiting for the server's
+    /// `AuthChallenge` nonce. Set when `sendHostAuth` is called before the
+    /// challenge has arrived; cleared once the auth frame is actually sent.
+    private var pendingHostAuthPoolInfo: PoolAdvertisementInfo?
+
+
+    // MARK: - E2E Encryption
+
+    /// Pool-level shared secret for encrypting WebSocket relay messages.
+    /// When set, all outgoing messages are AES-GCM encrypted and incoming
+    /// messages are decrypted before delivery to the delegate.
+    /// Must be set after pool session establishment (host auth or join accepted).
+    public var poolSharedSecret: SymmetricKey?
+
+    /// Cached AES-GCM encryption key derived from the pool shared secret.
+    /// Invalidated when `poolSharedSecret` changes.
+    private var _cachedEncryptionKey: SymmetricKey?
+    private var _cachedEncryptionKeyPoolID: UUID?
+
+    /// Derives an AES-GCM encryption key from the pool shared secret using HKDF.
+    /// The key is cached for the lifetime of the current pool session.
+    private func wsEncryptionKey() -> SymmetricKey? {
+        guard let secret = poolSharedSecret, let pid = poolID else { return nil }
+        if let cached = _cachedEncryptionKey, _cachedEncryptionKeyPoolID == pid {
+            return cached
+        }
+        let key = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: secret,
+            info: Data("stealth-ws-encrypt".utf8),
+            outputByteCount: 32
+        )
+        _cachedEncryptionKey = key
+        _cachedEncryptionKeyPoolID = pid
+        return key
+    }
+
+    /// Encrypt data using AES-GCM with the derived WebSocket encryption key.
+    /// Returns the original data unchanged if no shared secret is configured yet
+    /// (e.g., before pool session establishment).
+    private func encryptForWS(_ plaintext: Data) -> Data {
+        guard let key = wsEncryptionKey() else { return plaintext }
+        do {
+            let sealedBox = try AES.GCM.seal(plaintext, using: key)
+            guard let combined = sealedBox.combined else { return plaintext }
+            return combined
+        } catch {
+            logMessage("[SECURITY] AES-GCM encryption failed: \(error.localizedDescription)")
+            return plaintext
+        }
+    }
+
+    /// Decrypt data using AES-GCM with the derived WebSocket encryption key.
+    /// Returns `nil` if decryption fails and a shared secret is set (tampered message).
+    /// Returns the original data unchanged if no shared secret is configured yet
+    /// (e.g., before pool session establishment).
+    private func decryptFromWS(_ ciphertext: Data) -> Data? {
+        guard let key = wsEncryptionKey() else {
+            // No shared secret yet — pass through as-is (pre-session messages).
+            return ciphertext
+        }
+        do {
+            let sealedBox = try AES.GCM.SealedBox(combined: ciphertext)
+            return try AES.GCM.open(sealedBox, using: key)
+        } catch {
+            // Decryption failed with a shared secret set — message is tampered.
+            logMessage("[SECURITY] AES-GCM decryption failed, dropping message (tampered or malformed)")
+            return nil
+        }
+    }
 
     // MARK: - Receive Loop
 
@@ -317,16 +405,23 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
 
     /// Broadcast data to all connected peers via the relay server.
     ///
+    /// When a pool shared secret is configured, the data is AES-GCM encrypted
+    /// before transmission. The relay server sees only opaque ciphertext.
+    ///
     /// - Parameters:
     ///   - data: The data to broadcast.
     ///   - reliable: Ignored for WebSocket (always reliable/ordered).
     public func broadcast(_ data: Data, reliable: Bool) {
-        let base64 = data.base64EncodedString()
+        let wireData = encryptForWS(data)
+        let base64 = wireData.base64EncodedString()
         let seq = nextSequence()
         sendFrame(.forward(ForwardData(data: base64, targetPeerIds: nil, sequence: seq)))
     }
 
     /// Send data to specific peers via the relay server.
+    ///
+    /// When a pool shared secret is configured, the data is AES-GCM encrypted
+    /// before transmission. The relay server sees only opaque ciphertext.
     ///
     /// - Parameters:
     ///   - data: The data to send.
@@ -334,7 +429,8 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     ///   - reliable: Ignored for WebSocket (always reliable/ordered).
     public func send(_ data: Data, to peerIDs: [String], reliable: Bool) {
         guard !peerIDs.isEmpty else { return }
-        let base64 = data.base64EncodedString()
+        let wireData = encryptForWS(data)
+        let base64 = wireData.base64EncodedString()
         let seq = nextSequence()
         sendFrame(.forward(ForwardData(data: base64, targetPeerIds: peerIDs, sequence: seq)))
     }
@@ -344,6 +440,10 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// Disconnect from the relay server and clean up all resources.
     public func disconnect() {
         intentionalDisconnect = true
+        serverIsUnclaimed = false
+        poolSharedSecret = nil
+        _cachedEncryptionKey = nil
+        _cachedEncryptionKeyPoolID = nil
         tearDown()
         updateState(.idle)
     }
@@ -453,6 +553,9 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         connectedPeers.removeAll()
         pendingJoinRequests.removeAll()
         lastPongTimestamp = nil
+        // Clear auth challenge state so a fresh nonce is required on reconnect.
+        authChallengeNonce = nil
+        pendingHostAuthPoolInfo = nil
     }
 
     /// Attempt to reconnect with exponential backoff.
@@ -485,7 +588,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
                 self.tearDown()
                 self.connect { [weak self] in
                     guard let self else { return }
-                    if self.isHostRole, let poolID = self.poolID {
+                    if self.isHostRole, !self.serverIsUnclaimed, let poolID = self.poolID {
                         self.sendHostAuth(poolInfo: PoolAdvertisementInfo(
                             poolID: poolID,
                             poolName: self.configuration.poolName,
@@ -541,9 +644,9 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
         }
     }
 
-    /// Injects the stored session token into privileged host frames before sending.
+    /// Injects the stored session token into outgoing frames before sending.
     private func injectSessionToken(into frame: ServerFrame) -> ServerFrame {
-        guard let token = sessionToken, isHostRole else { return frame }
+        guard let token = sessionToken else { return frame }
         switch frame {
         case .createInvitation(var data):
             data.sessionToken = token
@@ -568,7 +671,31 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     }
 
     /// Send host authentication frame signed with the host identity.
+    ///
+    /// If the server-issued auth challenge nonce is already available, the
+    /// signature includes the nonce for replay protection. Otherwise, the
+    /// pool info is stored as pending until the `AuthChallenge` frame arrives.
     private func sendHostAuth(poolInfo: PoolAdvertisementInfo) {
+        if authChallengeNonce != nil {
+            // Nonce available -- send immediately with nonce bound in signature.
+            sendHostAuthNow(poolInfo: poolInfo)
+        } else {
+            // Wait for the AuthChallenge frame from the server.
+            pendingHostAuthPoolInfo = poolInfo
+        }
+    }
+
+    /// Actually construct and send the HostAuth frame.
+    ///
+    /// Precondition: `authChallengeNonce` must be set (server must have sent `AuthChallenge`).
+    private func sendHostAuthNow(poolInfo: PoolAdvertisementInfo) {
+        guard let nonce = authChallengeNonce else {
+            logMessage("[SECURITY] Cannot send HostAuth: no auth challenge nonce received from server")
+            updateState(.failed(.authenticationFailed))
+            delegate?.transport(self, didFailWithError: .authenticationFailed)
+            return
+        }
+
         do {
             let identity = try RemotePoolService().getOrCreateHostIdentity()
             self.hostIdentity = identity
@@ -576,11 +703,20 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             let timestamp = Int64(Date().timeIntervalSince1970)
 
             // MUST match the Rust server's signature format:
-            // "STEALTH_HOST_AUTH_V1:" || pool_id_raw_bytes (16) || timestamp_be (8)
+            // "STEALTH_HOST_AUTH_V1:" || pool_id_raw_bytes (16) || timestamp_be (8) || nonce_raw
             var signData = Data("STEALTH_HOST_AUTH_V1:".utf8)
             let uuid = poolInfo.poolID
             signData.append(contentsOf: withUnsafeBytes(of: uuid.uuid) { Data($0) })
             signData.append(contentsOf: withUnsafeBytes(of: timestamp.bigEndian) { Data($0) })
+
+            // Append raw nonce bytes from the server-issued challenge for replay protection.
+            guard let nonceData = Data(base64Encoded: nonce) else {
+                logMessage("[SECURITY] Cannot send HostAuth: invalid nonce encoding")
+                updateState(.failed(.authenticationFailed))
+                delegate?.transport(self, didFailWithError: .authenticationFailed)
+                return
+            }
+            signData.append(nonceData)
 
             let signature = try identity.sign(signData)
 
@@ -590,7 +726,8 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
                 signature: signature.base64EncodedString(),
                 poolId: poolInfo.poolID,
                 serverUrl: configuration.serverURL.absoluteString,
-                displayName: localPeerName
+                displayName: localPeerName,
+                nonce: nonce
             ))
             sendFrame(frame)
         } catch {
@@ -799,6 +936,12 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
                             return
                         }
 
+                        // Drop oversized frames to prevent memory exhaustion from malicious servers
+                        guard data.count <= Self.maxWebSocketFrameSize else {
+                            self.logMessage("[SECURITY] Dropping oversized WebSocket frame: \(data.count) bytes exceeds \(Self.maxWebSocketFrameSize) byte limit")
+                            return
+                        }
+
                         do {
                             let frame = try ServerFrame.fromJSON(data)
                             self.handleFrame(frame)
@@ -822,6 +965,15 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
     /// Handle a received ``ServerFrame`` from the server.
     private func handleFrame(_ frame: ServerFrame) {
         switch frame {
+        case .authChallenge(let data):
+            // SECURITY: H-3 -- Store the server-issued nonce for replay protection.
+            // If a HostAuth was deferred waiting for this challenge, send it now.
+            authChallengeNonce = data.nonce
+            if let poolInfo = pendingHostAuthPoolInfo {
+                pendingHostAuthPoolInfo = nil
+                sendHostAuthNow(poolInfo: poolInfo)
+            }
+
         case .serverHello:
             // Server hello received; connection is established.
             // Server hello is informational; auth is sent in connect().
@@ -881,9 +1033,12 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             delegate?.transport(self, peerDidDisconnect: data.peerId)
 
         case .relayed(let data):
-            // Decode base64 data and deliver to delegate
+            // Decode base64 data, decrypt if E2E encryption is active, and deliver to delegate
             if let rawData = Data(base64Encoded: data.data) {
-                delegate?.transport(self, didReceiveData: rawData, from: data.fromPeerId)
+                if let plaintext = decryptFromWS(rawData) {
+                    delegate?.transport(self, didReceiveData: plaintext, from: data.fromPeerId)
+                }
+                // If decryptFromWS returns nil, the message was tampered — silently dropped
             }
             // Acknowledge receipt
             sendFrame(.ack(AckData(sequence: data.sequence)))
@@ -948,6 +1103,7 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
             let transportError: TransportError
             let lowerMessage = data.message.lowercased()
             if lowerMessage.contains("not yet claimed") || lowerMessage.contains("unclaimed") || lowerMessage.contains("not claimed") {
+                serverIsUnclaimed = true
                 transportError = .serverUnclaimed
             } else {
                 switch data.code {
@@ -975,6 +1131,8 @@ public final class WebSocketTransport: NSObject, TransportProvider, @unchecked S
 
         case .claimSuccess(let data):
             logMessage("Server claimed successfully (fingerprint: \(data.serverFingerprint.prefix(8))...)")
+            serverIsUnclaimed = false
+            lastClaimSuccess = data
             // Deliver the claim success via the one-shot continuation if set.
             deliverClaimSuccess(data)
             // Also notify delegate that the connection is ready for HostAuth.

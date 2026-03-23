@@ -43,14 +43,18 @@ Zero external dependencies. Everything ships in one Swift package.
 
 ### Remote Relay Transport ([StealthRelay](https://github.com/Olib-AI/StealthRelay))
 
-- **WebSocket transport** — Connect to a self-hosted relay server from anywhere via `ws://` or `wss://`
+- **WebSocket transport** — Connect to a self-hosted relay server from anywhere via `wss://` (default) or `ws://` if explicitly specified
 - **Ed25519 host authentication** — The host signs pool creation with a Keychain-stored Ed25519 identity
 - **Invitation-based joining** — Shareable `stealth://invite/...` URLs with Ed25519 signatures, HMAC proofs, and configurable expiry
 - **Proof-of-Work anti-DoS** — Joining peers solve a SHA-256 PoW challenge (18-bit difficulty, ~50ms) before the server forwards the request to the host
+- **End-to-end encrypted relay messages** — Messages relayed via WebSocket are AES-GCM encrypted with a key derived from the pool shared secret via HKDF-SHA256; the relay server sees only opaque ciphertext
 - **Session tokens** — All privileged operations (create invitation, kick peer, close pool) require a server-issued session token
 - **TLS certificate pinning** — SPKI SHA-256 pin verification via custom `URLSessionDelegate`
 - **Server claiming** — First-use server binding via QR code or manual claim code from Docker logs
+- **Recovery key after claim** — After claiming a server, the recovery key is displayed in a dedicated sheet with options to save to the password manager or copy to clipboard; the user must acknowledge before proceeding
 - **Automatic reconnection** — Exponential backoff with invitation expiry checks; previously-approved peers are auto-accepted on reconnect
+- **Relay bridge deduplication** — Messages bridged between relay and primary sessions are deduplicated by `PoolMessage.id` to prevent double processing
+- **1 MB WebSocket frame limit** — Incoming WebSocket frames exceeding 1 MB are dropped before processing to prevent memory exhaustion from malicious servers
 - **Cloudflare Tunnel support** — Production deployment via `cloudflared` for TLS termination without managing certificates
 
 ## Architecture
@@ -117,8 +121,10 @@ sequenceDiagram
     participant Relay as StealthRelay - Rust
     participant Joiner as Joiner - iOS
 
-    Host->>Relay: HostAuth (Ed25519 signed, wss)
-    Relay->>Relay: Verify Ed25519, create pool
+    Host->>Relay: Connect (wss)
+    Relay->>Host: AuthChallenge (nonce)
+    Host->>Relay: HostAuth (Ed25519 signed, nonce-bound)
+    Relay->>Relay: Verify Ed25519 + nonce, create pool
     Relay->>Host: Session token
 
     Host->>Relay: Create invitation (token)
@@ -156,8 +162,9 @@ A global rate limiter tracks total wrong code attempts across all peers — 10 f
 
 | Layer | Mechanism |
 |-------|-----------|
-| **Host Authentication** | Ed25519 signature over `pool_id \|\| timestamp` verified by the relay server |
-| **Session Tokens** | 32-byte server-issued token required for all privileged host operations (constant-time comparison) |
+| **Host Authentication** | Ed25519 signature over `pool_id \|\| timestamp \|\| nonce` where nonce is a server-issued per-connection challenge; timestamp window tightened to 30 seconds |
+| **E2E Relay Encryption** | AES-GCM encryption with a key derived from the pool shared secret via HKDF-SHA256 (`stealth-ws-encrypt` info); the relay server sees only opaque ciphertext |
+| **Session Tokens** | 32-byte server-issued token required for all privileged operations from both host and guest peers; included in Forward frames for all roles (constant-time comparison) |
 | **Invitation Tokens** | Ed25519-signed URLs with HMAC proof-of-possession, configurable expiry and max uses, `server_address` bound in signature |
 | **Proof-of-Work** | SHA-256 hashcash (18-bit difficulty) required before join requests are forwarded to the host |
 | **TLS Pinning** | SPKI SHA-256 hash pinning via `URLSessionDelegate` (optional, for production deployments) |
@@ -188,6 +195,8 @@ The HMAC key is derived from a pool-level shared secret (not the pool UUID) usin
 | **Message expiry** (5 minutes) | Replay of old messages |
 | **Pool ID validation** | Cross-pool message injection |
 | **Topology broadcast freshness** (120s max age) | Replay of stale routing info |
+| **Topology broadcast HMAC** (HMAC-SHA256) | Unsigned or tampered topology broadcasts are rejected when a pool shared secret is set |
+| **WebSocket frame size limit** (1 MB) | Memory exhaustion from oversized frames sent by malicious servers |
 
 ### Inbound Size Limits
 
@@ -439,6 +448,15 @@ struct SecureStorage: BlockListStorageProvider {
 ConnectionPoolConfiguration.blockListStorageProvider = SecureStorage()
 ```
 
+### Injecting Encrypted Remote Pool State Storage
+
+```swift
+// Same protocol as block list storage — reuse your SecureStorage implementation
+ConnectionPoolConfiguration.remotePoolStateStorageProvider = SecureStorage()
+```
+
+When set, `RemotePoolState` persists through this provider instead of plain `UserDefaults`, preventing connection history (server URL, pool ID, host status) from being stored unencrypted.
+
 ## API Reference
 
 ### Core Services
@@ -467,7 +485,7 @@ ConnectionPoolConfiguration.blockListStorageProvider = SecureStorage()
 | `TopologyBroadcast` | Payload for sharing a peer's direct neighbors with the mesh. |
 | `PoolUserProfile` | User-facing profile: display name, avatar emoji, color index. |
 | `RemotePoolConfiguration` | Settings for remote relay connections: server URL, pool name, max peers, heartbeat interval, SPKI pin hash. |
-| `RemotePoolState` | Persisted state for remote pool connections (server URL, pool ID, claim status). |
+| `RemotePoolState` | Persisted state for remote pool connections (server URL, pool ID, claim status). Storage is pluggable via `remotePoolStateStorageProvider` (defaults to `UserDefaults`). |
 | `RemoteInvitation` | An active invitation with token ID, shareable URL, expiry, and max uses. |
 | `ParsedInvitation` | Decoded invitation URL fields: pool ID, token secret, server address, host fingerprint. |
 | `RemoteHostIdentity` | Ed25519 signing identity for the pool host (Keychain-stored private key). |

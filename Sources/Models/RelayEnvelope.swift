@@ -81,7 +81,7 @@ public struct RelayEnvelope: Codable, Sendable, Identifiable, Hashable {
     /// Optional HMAC over routing metadata for integrity protection.
     ///
     /// When present, receivers MUST verify the HMAC before processing.
-    /// When absent (backwards compatibility), the envelope is accepted with a warning.
+    /// Envelopes without a valid HMAC are rejected when a pool shared secret is set.
     /// The HMAC covers: originPeerID, destinationPeerID, poolID, messageID, ttl, timestamp.
     /// This prevents relay nodes from tampering with routing metadata (TTL, hop path, origin).
     public var envelopeHMAC: Data?

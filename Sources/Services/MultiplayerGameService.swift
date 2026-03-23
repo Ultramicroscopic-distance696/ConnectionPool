@@ -89,6 +89,10 @@ public final class MultiplayerGameService: ObservableObject {
     private func setupBindings() {
         guard let poolManager = poolManager else { return }
 
+        // Clear previous subscriptions to prevent duplicate processing when
+        // setPoolManager is called multiple times (e.g., window close/reopen cycles).
+        cancellables.removeAll()
+
         // Subscribe to messages
         poolManager.messageReceived
             .receive(on: DispatchQueue.main)

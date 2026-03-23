@@ -7,6 +7,7 @@
 import Foundation
 @preconcurrency import MultipeerConnectivity
 import Combine
+import CryptoKit
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -142,8 +143,26 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// Block list service for persistent device blocking
     private let blockListService = DeviceBlockListService.shared
 
-    /// Tracked delayed tasks so they can be cancelled on disconnect
-    private var delayedTasks: [Task<Void, Never>] = []
+    /// Mesh relay service for multi-hop message routing through the mesh network.
+    /// Initialized lazily after peerID is set up so we have the local peer identifier.
+    private var meshRelayService: MeshRelayService?
+
+    /// Tracked delayed tasks so they can be cancelled on disconnect.
+    /// Completed tasks are automatically removed via `trackDelayedTask(_:)`.
+    private var delayedTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// Deduplication cache for relay-bridged messages to prevent double processing
+    private let relayBridgeDeduplicationCache = MessageDeduplicationCache()
+
+    /// Track a delayed task, automatically removing it from the dictionary when it completes.
+    private func trackDelayedTask(_ task: Task<Void, Never>) {
+        let taskID = UUID()
+        delayedTasks[taskID] = task
+        Task { @MainActor [weak self] in
+            await task.value
+            self?.delayedTasks.removeValue(forKey: taskID)
+        }
+    }
 
     /// Per-peer cooldown: tracks the last connection attempt timestamp per peer display name.
     /// SECURITY NOTE: Keyed by attacker-controlled display name. This is a supplementary
@@ -264,6 +283,10 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
     /// The discovered peer we're currently joining (stored for session creation on connect)
     private var joiningPeer: DiscoveredPeer?
 
+    /// The pool code used when joining a pool (retained for mesh relay shared secret derivation).
+    /// Cleared on disconnect.
+    private var joiningPoolCode: String?
+
     // MARK: - Initialization
 
     public override init() {
@@ -271,6 +294,15 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         setupPeerID()
         loadProfile()
         loadFailedAttemptCounts()
+        setupMeshRelayService()
+    }
+
+    /// Creates and wires the MeshRelayService after peerID is available.
+    private func setupMeshRelayService() {
+        guard peerID != nil else { return }
+        let service = MeshRelayService(localPeerID: localPeerID)
+        service.setPoolManager(self)
+        meshRelayService = service
     }
 
     private func setupPeerID() {
@@ -437,11 +469,11 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
     /// Broadcast current profile to all connected peers
     public func broadcastProfile() {
-        guard let peerID = peerID else { return }
+        guard !localPeerID.isEmpty else { return }
 
         log("[CALLER_TRACE] broadcastProfile() called", category: .network)
         let message = PoolMessage.profileUpdate(
-            from: peerID.displayName,
+            from: localPeerID,
             senderName: localProfile.displayName,
             profile: localProfile
         )
@@ -494,7 +526,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         // Create session info
         currentSession = PoolSession(
             name: configuration.name,
-            hostPeerID: peerID.displayName,
+            hostPeerID: localPeerID,
             maxPeers: configuration.maxPeers,
             isEncrypted: configuration.requireEncryption,
             poolCode: poolCode
@@ -502,7 +534,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         // Add self as host peer with profile
         let hostPeer = Peer(
-            id: peerID.displayName,
+            id: localPeerID,
             displayName: localProfile.displayName,
             isHost: true,
             status: .connected,
@@ -539,6 +571,16 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         poolState = .hosting
         log("Started hosting pool: \(configuration.name)", category: .network)
 
+        // Wire mesh relay service with pool context
+        if let session = currentSession {
+            meshRelayService?.setCurrentPool(session.id)
+            // Derive symmetric key from pool code (shared secret between all members)
+            if let code = session.poolCode {
+                let keyData = SHA256.hash(data: Data(code.utf8))
+                meshRelayService?.poolSharedSecret = SymmetricKey(data: keyData)
+            }
+        }
+
         // Start relay advertising for the host as well
         // This allows peers that are out of the host's direct range but within range
         // of other connected peers to discover the pool. The relay advertiser uses a
@@ -549,7 +591,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
                 self.startRelayAdvertising()
             }
         }
-        delayedTasks.append(relayTask)
+        trackDelayedTask(relayTask)
     }
 
     /// Start browsing for available pools
@@ -642,6 +684,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         // Store the joining peer info for session creation on successful connect
         joiningPeer = peer
+        joiningPoolCode = poolCode
 
         poolState = .connecting
 
@@ -848,21 +891,50 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
             }
         }
 
-        if sentToPrimary == 0 && sentToRelay == 0 {
+        // HOST-ROUTE: If we are NOT the host and some target peers were not reachable
+        // via our primary or relay session, send the message to the HOST for relay.
+        // In hub-and-spoke MC topology, members can only reach the host directly.
+        // The host relay (in session(_:didReceive:fromPeer:)) forwards to other members.
+        if sentToPrimary == 0 && sentToRelay == 0 && !isHost {
+            // Find the host in our primary session
+            if let session = session {
+                let hostPeers = session.connectedPeers.filter { mcPeer in
+                    let pid = peerIDMap[mcPeer] ?? mcPeer.displayName
+                    // The host is the first peer we connected to, or marked isHost
+                    return connectedPeers.first(where: { $0.id == pid })?.isHost == true
+                }.filter { mcPeer in
+                    let pid = peerIDMap[mcPeer] ?? mcPeer.displayName
+                    return isDTLSStable(for: pid)
+                }
+
+                if let hostMCPeer = hostPeers.first {
+                    do {
+                        try session.send(data, toPeers: [hostMCPeer], with: mode)
+                        log("[HOST_ROUTE] Routed targeted \(message.type.rawValue) for \(peerIDs.count) unreachable peer(s) through host", category: .network)
+                    } catch {
+                        log("[HOST_ROUTE] Failed to route through host: \(error.localizedDescription)", level: .error, category: .network)
+                    }
+                } else {
+                    log("No matching reachable peers found for targeted message delivery to \(peerIDs.count) peer(s)", level: .warning, category: .network)
+                }
+            } else {
+                log("No matching reachable peers found for targeted message delivery to \(peerIDs.count) peer(s)", level: .warning, category: .network)
+            }
+        } else if sentToPrimary == 0 && sentToRelay == 0 {
             log("No matching reachable peers found for targeted message delivery to \(peerIDs.count) peer(s)", level: .warning, category: .network)
         }
     }
 
     /// Send a chat message
     public func sendChat(_ text: String) {
-        guard let peerID = peerID else {
+        guard !localPeerID.isEmpty else {
             log("Cannot send chat: peerID not initialized", category: .network)
             return
         }
 
         log("[CALLER_TRACE] sendChat() called with text length: \(text.count)", category: .network)
         let message = PoolMessage.chat(
-            from: peerID.displayName,
+            from: localPeerID,
             senderName: localProfile.displayName,
             text: text
         )
@@ -928,8 +1000,13 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         session = nil
 
         // Cancel all pending delayed tasks
-        delayedTasks.forEach { $0.cancel() }
+        delayedTasks.values.forEach { $0.cancel() }
         delayedTasks.removeAll()
+
+        // Clear remote transport bridge state so subsequent local sessions
+        // do not route messages through a stale/disconnected WebSocket.
+        remoteTransport = nil
+        remotePeerID = nil
 
         // Clear state
         connectedPeers = []
@@ -946,9 +1023,13 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         connectedViaRelayPeerID = nil
         discoveredPoolIDs = []
         joiningPeer = nil
+        joiningPoolCode = nil
         relayPeerIDMap = [:]
         relayPeerConnectionTimes = [:]
         relayConnectedPeerIDs = []
+
+        // Clear mesh relay pool context
+        meshRelayService?.clearCurrentPool()
 
         poolState = .idle
         log("Disconnected from pool - all MC state cleaned up", category: .network)
@@ -960,9 +1041,15 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         // First perform full disconnect
         disconnect()
 
+        // Clean up old mesh relay service before recreating
+        meshRelayService?.cleanup()
+
         // Recreate peer ID to ensure completely fresh MC state
         // This is the nuclear option that guarantees no stale internal MC state
         setupPeerID()
+
+        // Recreate mesh relay service with new peer ID
+        setupMeshRelayService()
 
         log("ConnectionPoolManager fully reset with new peer ID", category: .network)
     }
@@ -1185,17 +1272,78 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
             let sendTime = Date()
             let elapsed = sendTime.timeIntervalSince(connectTime)
             log("[CALLER_TRACE] addConnectedPeer: sending profile update to \(targetPeerID) after \(String(format: "%.0f", elapsed * 1000))ms (DTLS stabilization complete)", category: .network)
-            if let peerID = self.peerID {
-                let message = PoolMessage.profileUpdate(
-                    from: peerID.displayName,
-                    senderName: localProfile.displayName,
-                    profile: localProfile
-                )
-                sendMessage(message, to: [targetPeerID])
-                log("Sent delayed profile update to \(targetPeerID)", level: .debug, category: .network)
-            }
+            let senderID = self.localPeerID
+            guard !senderID.isEmpty else { return }
+            let message = PoolMessage.profileUpdate(
+                from: senderID,
+                senderName: self.localProfile.displayName,
+                profile: self.localProfile
+            )
+            self.sendMessage(message, to: [targetPeerID])
+            log("Sent delayed profile update to \(targetPeerID)", level: .debug, category: .network)
         }
-        delayedTasks.append(profileTask)
+        trackDelayedTask(profileTask)
+
+        // HOST PEER ROSTER BROADCAST: In local MC mode, peers only have a direct
+        // connection to the host. They don't know about each other. The host must
+        // broadcast peer info so that all members are aware of every other member.
+        // This enables key exchange and encrypted chat between non-adjacent peers.
+        if isHost {
+            let rosterTask = Task { @MainActor in
+                // Wait for DTLS stabilization before sending roster
+                try? await Task.sleep(for: .milliseconds(2600))
+                guard !Task.isCancelled else { return }
+
+                let senderID = self.localPeerID
+                guard !senderID.isEmpty else { return }
+
+                // 1. Tell ALL existing peers about the new peer
+                let otherPeers = self.connectedPeers.filter { $0.id != targetPeerID && $0.id != senderID }
+                let newPeer = self.connectedPeers.first(where: { $0.id == targetPeerID })
+                if !otherPeers.isEmpty {
+                    let newPeerInfo = PeerInfoPayload(
+                        peerID: targetPeerID,
+                        displayName: newPeer?.displayName ?? targetPeerID,
+                        isHost: false,
+                        capabilities: [],
+                        profile: newPeer?.profile
+                    )
+                    guard let infoData = try? JSONEncoder().encode(newPeerInfo) else { return }
+                    let infoMsg = PoolMessage(
+                        type: .peerInfo,
+                        senderID: senderID,
+                        senderName: self.localProfile.displayName,
+                        payload: infoData
+                    )
+                    let existingIDs = otherPeers.map { $0.id }
+                    self.sendMessage(infoMsg, to: existingIDs)
+                    log("[HOST_ROSTER] Broadcast new peer \(targetPeerID.prefix(8))... to \(existingIDs.count) existing peer(s)", category: .network)
+                }
+
+                // 2. Tell the NEW peer about every existing member (excluding host and the new peer itself)
+                for existing in otherPeers {
+                    let existingPeerInfo = PeerInfoPayload(
+                        peerID: existing.id,
+                        displayName: existing.displayName,
+                        isHost: existing.isHost,
+                        capabilities: [],
+                        profile: existing.profile
+                    )
+                    guard let existingData = try? JSONEncoder().encode(existingPeerInfo) else { continue }
+                    let existingMsg = PoolMessage(
+                        type: .peerInfo,
+                        senderID: senderID,
+                        senderName: self.localProfile.displayName,
+                        payload: existingData
+                    )
+                    self.sendMessage(existingMsg, to: [targetPeerID])
+                }
+                if !otherPeers.isEmpty {
+                    log("[HOST_ROSTER] Sent \(otherPeers.count) existing peer(s) to new peer \(targetPeerID.prefix(8))...", category: .network)
+                }
+            }
+            trackDelayedTask(rosterTask)
+        }
 
         // Publish event
         peerEvent.send(.connected(peer))
@@ -1271,6 +1419,9 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         log("[RELAY_SESSION] Relay peer connected: \(peerIDString)", category: .network)
 
+        // Notify mesh relay service of relay peer connection
+        meshRelayService?.peerConnected(peerIDString)
+
         // Add to connectedPeers as a relayed peer (if not already present)
         if !connectedPeers.contains(where: { $0.id == peerIDString }) {
             let peer = Peer(
@@ -1294,16 +1445,16 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
             guard self.relayConnectedPeerIDs.contains(peerIDString) else { return }
             let elapsed = Date().timeIntervalSince(connectTime)
             log("[RELAY_SESSION] Sending profile to relay peer \(peerIDString) after \(String(format: "%.0f", elapsed * 1000))ms", category: .network)
-            if let localPeerID = self.peerID {
-                let message = PoolMessage.profileUpdate(
-                    from: localPeerID.displayName,
-                    senderName: self.localProfile.displayName,
-                    profile: self.localProfile
-                )
-                self.sendMessage(message, to: [peerIDString])
-            }
+            let senderID = self.localPeerID
+            guard !senderID.isEmpty else { return }
+            let message = PoolMessage.profileUpdate(
+                from: senderID,
+                senderName: self.localProfile.displayName,
+                profile: self.localProfile
+            )
+            self.sendMessage(message, to: [peerIDString])
         }
-        delayedTasks.append(relayProfileTask)
+        trackDelayedTask(relayProfileTask)
     }
 
     /// Called when a peer disconnects from the relay session
@@ -1314,6 +1465,9 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
         relayConnectedPeerIDs.remove(peerIDString)
 
         log("[RELAY_SESSION] Relay peer disconnected: \(peerIDString)", category: .network)
+
+        // Notify mesh relay service of relay peer disconnection
+        meshRelayService?.peerDisconnected(peerIDString)
 
         // Remove from connectedPeers if it was a relay-only peer
         if let peer = connectedPeers.first(where: { $0.id == peerIDString && $0.connectionType == .relayed }) {
@@ -1349,14 +1503,40 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
 
         log("[RELAY_SESSION] Received \(message.type.rawValue) from relay peer: \(peerDisplayName)", category: .network)
 
+        // Route relay envelopes to the mesh relay service for multi-hop processing
+        if message.type == .relay {
+            if let envelope = RelayEnvelope.decode(from: message.payload) {
+                meshRelayService?.handleRelayEnvelope(envelope, from: peerDisplayName)
+            } else {
+                log("[MESH_RELAY] Failed to decode RelayEnvelope from relay peer \(peerDisplayName)", level: .warning, category: .network)
+            }
+        }
+
+        // Route system messages to mesh relay service for topology broadcast processing
+        if message.type == .system {
+            meshRelayService?.processSystemMessage(message)
+        }
+
+        // Deduplicate relay-bridged messages to prevent double processing
+        // (messages may arrive via both relay and primary paths)
+        guard !relayBridgeDeduplicationCache.hasProcessed(message.id) else {
+            log("[RELAY_BRIDGE] Dropping duplicate message \(message.id) from relay peer: \(peerDisplayName)", level: .debug, category: .network)
+            return
+        }
+        relayBridgeDeduplicationCache.markProcessed(message.id)
+
         // Bridge the message to all primary session peers (forwarding)
         // This is the core relay bridging: messages from relay peers are forwarded to pool peers
         messageReceived.send(message)
 
         // Forward to primary session peers so they see relay peer messages
+        // HIGH-001 FIX: Exclude the original sender to prevent amplification loops
         if let session = session, !session.connectedPeers.isEmpty {
             if let encodedData = message.encode() {
-                let stablePeers = peersWithStableDTLS()
+                let stablePeers = peersWithStableDTLS().filter { mcPeer in
+                    let peerID = peerIDMap[mcPeer] ?? mcPeer.displayName
+                    return peerID != message.senderID
+                }
                 if !stablePeers.isEmpty {
                     do {
                         let mode: MCSessionSendDataMode = message.isReliable ? .reliable : .unreliable
@@ -1414,6 +1594,14 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
             )
 
             log("[RELAY_SESSION] Created PoolSession for relay joiner: name=\(joining.displayName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
+
+            // Wire mesh relay service with pool context for relay joiner
+            meshRelayService?.setCurrentPool(poolID)
+            if let code = joiningPoolCode {
+                let keyData = SHA256.hash(data: Data(code.utf8))
+                meshRelayService?.poolSharedSecret = SymmetricKey(data: keyData)
+            }
+
             joiningPeer = nil
         }
 
@@ -1442,7 +1630,7 @@ public final class ConnectionPoolManager: NSObject, ObservableObject {
                     self.startRelayAdvertising()
                 }
             }
-            delayedTasks.append(relayAdvTask)
+            trackDelayedTask(relayAdvTask)
         }
     }
 
@@ -1480,6 +1668,9 @@ extension ConnectionPoolManager: MCSessionDelegate {
                 log("[PEER_STATE] Peer disconnected: \(peerDisplayName) at \(disconnectTime) (epoch: \(String(format: "%.3f", disconnectTime.timeIntervalSince1970)))", category: .network)
                 removeConnectedPeer(capturedPeerID)
 
+                // Notify mesh relay service of peer disconnection
+                self.meshRelayService?.peerDisconnected(peerDisplayName)
+
                 // If we were connecting and lost connection, go back to browsing
                 if poolState == .connecting {
                     poolState = .browsing
@@ -1510,6 +1701,9 @@ extension ConnectionPoolManager: MCSessionDelegate {
                 }
 
                 addConnectedPeer(capturedPeerID)
+
+                // Notify mesh relay service of new peer connection
+                self.meshRelayService?.peerConnected(peerDisplayName)
 
                 // Update pool state if we were connecting
                 if poolState == .connecting {
@@ -1562,6 +1756,13 @@ extension ConnectionPoolManager: MCSessionDelegate {
 
                         log("Created PoolSession for non-host peer: name=\(joining.displayName), poolID=\(poolID), hostPeerID=\(hostID.prefix(8))...", category: .network)
 
+                        // Wire mesh relay service with pool context for joiner
+                        self.meshRelayService?.setCurrentPool(poolID)
+                        if let code = self.joiningPoolCode {
+                            let keyData = SHA256.hash(data: Data(code.utf8))
+                            self.meshRelayService?.poolSharedSecret = SymmetricKey(data: keyData)
+                        }
+
                         // Clear the joining peer reference
                         joiningPeer = nil
                     }
@@ -1569,9 +1770,9 @@ extension ConnectionPoolManager: MCSessionDelegate {
                     // FIX: Add self to connectedPeers for non-host peers
                     // The host adds themselves when hosting starts (line 222-229), but
                     // joiners never did - causing them to not see their own account in the UI
-                    if !isHost, let selfPeerID = self.peerID {
-                        let selfPeerIDString = selfPeerID.displayName
-                        if !connectedPeers.contains(where: { $0.id == selfPeerIDString }) {
+                    if !isHost {
+                        let selfPeerIDString = self.localPeerID
+                        if !selfPeerIDString.isEmpty, !connectedPeers.contains(where: { $0.id == selfPeerIDString }) {
                             let selfPeer = Peer(
                                 id: selfPeerIDString,
                                 displayName: localProfile.displayName,
@@ -1596,7 +1797,7 @@ extension ConnectionPoolManager: MCSessionDelegate {
                                 startRelayAdvertising()
                             }
                         }
-                        delayedTasks.append(delayedRelayTask)
+                        trackDelayedTask(delayedRelayTask)
                     }
                 }
 
@@ -1636,20 +1837,66 @@ extension ConnectionPoolManager: MCSessionDelegate {
         Task { @MainActor in
             let receiveTime = Date()
             log("[RECV_TRACE] Received message type=\(message.type.rawValue) from \(peerDisplayName) at \(receiveTime) (epoch: \(String(format: "%.3f", receiveTime.timeIntervalSince1970)))", category: .network)
+
+            // Route relay envelopes to the mesh relay service for multi-hop processing
+            if message.type == .relay {
+                if let envelope = RelayEnvelope.decode(from: message.payload) {
+                    self.meshRelayService?.handleRelayEnvelope(envelope, from: peerDisplayName)
+                } else {
+                    log("[MESH_RELAY] Failed to decode RelayEnvelope from primary peer \(peerDisplayName)", level: .warning, category: .network)
+                }
+            }
+
+            // Route system messages to mesh relay service for topology broadcast processing
+            if message.type == .system {
+                self.meshRelayService?.processSystemMessage(message)
+            }
+
             messageReceived.send(message)
+
+            // HOST RELAY: Forward messages from one primary peer to all OTHER primary peers.
+            // MultipeerConnectivity uses a hub-and-spoke topology where each member connects
+            // only to the host. Without this relay, member A cannot see messages from member B
+            // because they share no direct MC link. The host must act as a message broker,
+            // similar to how the WebSocket server broadcasts in remote mode.
+            if self.isHost, let session = self.session {
+                let otherPrimaryPeers = self.peersWithStableDTLS().filter { mcPeer in
+                    let pid = self.peerIDMap[mcPeer] ?? mcPeer.displayName
+                    return pid != message.senderID
+                }
+                if !otherPrimaryPeers.isEmpty {
+                    do {
+                        let mode: MCSessionSendDataMode = message.isReliable ? .reliable : .unreliable
+                        try session.send(data, toPeers: otherPrimaryPeers, with: mode)
+                        log("[HOST_RELAY] Forwarded \(message.type.rawValue) from \(peerDisplayName) to \(otherPrimaryPeers.count) other primary peer(s)", category: .network)
+                    } catch {
+                        log("[HOST_RELAY] Failed to forward to primary peers: \(error.localizedDescription)", level: .error, category: .network)
+                    }
+                }
+            }
 
             // Bridge: Forward messages from primary peers to relay-connected peers
             // This enables relay-connected peers to receive messages from all pool members
+            // HIGH-001 FIX: Check dedup cache and exclude original sender to prevent amplification
             if let relaySession = self.relaySession, !self.relayConnectedPeerIDs.isEmpty {
-                let stableRelayPeers = self.relayPeersWithStableDTLS()
-                if !stableRelayPeers.isEmpty {
-                    do {
-                        let mode: MCSessionSendDataMode = message.isReliable ? .reliable : .unreliable
-                        try relaySession.send(data, toPeers: stableRelayPeers, with: mode)
-                        log("[RELAY_BRIDGE] Forwarded \(message.type.rawValue) from primary peer \(peerDisplayName) to \(stableRelayPeers.count) relay peers", category: .network)
-                    } catch {
-                        log("[RELAY_BRIDGE] Failed to forward to relay peers: \(error.localizedDescription)", level: .error, category: .network)
+                if !self.relayBridgeDeduplicationCache.hasProcessed(message.id) {
+                    self.relayBridgeDeduplicationCache.markProcessed(message.id)
+
+                    let stableRelayPeers = self.relayPeersWithStableDTLS().filter { mcPeer in
+                        let relayPeerID = self.relayPeerIDMap[mcPeer] ?? mcPeer.displayName
+                        return relayPeerID != message.senderID
                     }
+                    if !stableRelayPeers.isEmpty {
+                        do {
+                            let mode: MCSessionSendDataMode = message.isReliable ? .reliable : .unreliable
+                            try relaySession.send(data, toPeers: stableRelayPeers, with: mode)
+                            log("[RELAY_BRIDGE] Forwarded \(message.type.rawValue) from primary peer \(peerDisplayName) to \(stableRelayPeers.count) relay peers", category: .network)
+                        } catch {
+                            log("[RELAY_BRIDGE] Failed to forward to relay peers: \(error.localizedDescription)", level: .error, category: .network)
+                        }
+                    }
+                } else {
+                    log("[RELAY_BRIDGE] Skipping primary->relay forward for duplicate message \(message.id)", level: .debug, category: .network)
                 }
             }
         }

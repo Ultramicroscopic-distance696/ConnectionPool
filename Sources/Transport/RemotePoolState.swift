@@ -9,7 +9,8 @@
 import Foundation
 
 /// Saved state for a remote pool connection.
-/// Stored in UserDefaults so the app can auto-reconnect on launch.
+/// Persisted via the configured secure storage provider (or UserDefaults
+/// when no provider is set) so the app can auto-reconnect on launch.
 public struct RemotePoolState: Codable, Sendable {
     /// The relay server URL (e.g., "ws://localhost:9090").
     public var serverURL: String
@@ -53,14 +54,39 @@ public struct RemotePoolState: Codable, Sendable {
 
     private static let storageKey = "remote_pool_state"
 
-    /// Save to UserDefaults.
-    public func save() {
-        guard let data = try? JSONEncoder().encode(self) else { return }
-        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    /// Returns the secure storage provider if configured, otherwise `nil`.
+    /// Must be accessed from `@MainActor` since the configuration property is `@MainActor`-isolated.
+    @MainActor
+    private static var secureProvider: BlockListStorageProvider? {
+        ConnectionPoolConfiguration.remotePoolStateStorageProvider
     }
 
-    /// Load from UserDefaults.
+    /// Save state, using the secure storage provider when available,
+    /// falling back to UserDefaults when no provider is configured.
+    @MainActor
+    public func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+
+        if let provider = Self.secureProvider {
+            try? provider.save(data, forKey: Self.storageKey)
+        } else {
+            UserDefaults.standard.set(data, forKey: Self.storageKey)
+        }
+    }
+
+    /// Load state, using the secure storage provider when available,
+    /// falling back to UserDefaults when no provider is configured.
+    @MainActor
     public static func load() -> RemotePoolState? {
+        if let provider = secureProvider {
+            guard let data = try? provider.load(forKey: storageKey),
+                  let state = try? JSONDecoder().decode(RemotePoolState.self, from: data) else {
+                return nil
+            }
+            return state
+        }
+
+        // No secure provider — use UserDefaults
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let state = try? JSONDecoder().decode(RemotePoolState.self, from: data) else {
             return nil
@@ -69,7 +95,12 @@ public struct RemotePoolState: Codable, Sendable {
     }
 
     /// Clear saved state.
+    @MainActor
     public static func clear() {
-        UserDefaults.standard.removeObject(forKey: storageKey)
+        if let provider = secureProvider {
+            try? provider.save(Data(), forKey: storageKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: storageKey)
+        }
     }
 }

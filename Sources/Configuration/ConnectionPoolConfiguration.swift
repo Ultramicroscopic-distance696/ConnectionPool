@@ -43,4 +43,15 @@ public enum ConnectionPoolConfiguration {
     /// Set this at app startup alongside the logger, before any ConnectionPool
     /// APIs are used.
     @MainActor public static var blockListStorageProvider: BlockListStorageProvider?
+
+    /// Optional secure storage provider for remote pool connection state.
+    ///
+    /// When set, `RemotePoolState` persists through this provider instead of
+    /// plain `UserDefaults`. The host app should wire this to an encrypted
+    /// storage backend (e.g., Keychain or SecureDataStore) to prevent leaking
+    /// connection history (server URL, pool ID, host status).
+    ///
+    /// Set this at app startup alongside the logger, before any ConnectionPool
+    /// APIs are used.
+    @MainActor public static var remotePoolStateStorageProvider: (any BlockListStorageProvider)?
 }

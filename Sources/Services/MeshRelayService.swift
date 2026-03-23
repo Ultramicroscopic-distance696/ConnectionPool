@@ -25,8 +25,12 @@ final class MessageDeduplicationCache: @unchecked Sendable {
     private let lock = NSLock()
     /// Maps message ID to its timestamp for expiration checks.
     private var seenMessages: [UUID: Date] = [:]
-    /// Tracks insertion order for O(1) eviction of oldest entries.
+    /// Tracks insertion order for FIFO eviction of oldest entries.
     private var insertionOrder: [UUID] = []
+    /// Head index into `insertionOrder` for O(1) amortized eviction.
+    /// Entries before this index are logically removed; the array is compacted
+    /// when the head passes the midpoint to bound wasted space.
+    private var insertionHead: Int = 0
     private let expirationInterval: TimeInterval = 300 // 5 minutes
 
     /// Maximum number of entries allowed in the cache. When exceeded, the oldest entries are evicted.
@@ -66,11 +70,18 @@ final class MessageDeduplicationCache: @unchecked Sendable {
             seenMessages[messageID] = now
 
             // Evict oldest entries when cache exceeds maximum size.
-            // O(1) amortized: remove from the front of the insertion order queue.
-            while seenMessages.count > maxCacheSize, !insertionOrder.isEmpty {
-                let oldest = insertionOrder.removeFirst()
+            // O(1) amortized: advance head index instead of shifting the array.
+            while seenMessages.count > maxCacheSize, insertionHead < insertionOrder.count {
+                let oldest = insertionOrder[insertionHead]
+                insertionHead += 1
                 // Only remove from dict if it still exists (may have been expired already)
                 seenMessages.removeValue(forKey: oldest)
+            }
+
+            // Compact: reclaim memory when head passes the midpoint
+            if insertionHead > insertionOrder.count / 2, insertionHead > 0 {
+                insertionOrder.removeFirst(insertionHead)
+                insertionHead = 0
             }
         }
     }
@@ -80,7 +91,9 @@ final class MessageDeduplicationCache: @unchecked Sendable {
         let cutoff = Date().addingTimeInterval(-expirationInterval)
         lock.withLock {
             seenMessages = seenMessages.filter { $0.value > cutoff }
-            // Compact the insertion order by removing entries no longer in the dict
+            // Rebuild insertion order with only surviving entries
+            insertionOrder.removeFirst(insertionHead)
+            insertionHead = 0
             insertionOrder.removeAll { seenMessages[$0] == nil }
         }
     }
@@ -147,8 +160,8 @@ public final class MeshRelayService: ObservableObject {
     private let topologyBroadcastMaxAge: TimeInterval = 120.0
 
     private var cancellables = Set<AnyCancellable>()
-    private var topologyBroadcastTimer: Timer?
-    private var pruneTimer: Timer?
+    private var topologyBroadcastTask: Task<Void, Never>?
+    private var pruneTask: Task<Void, Never>?
     private var currentPoolID: UUID?
     
     /// Interval between topology broadcasts (60 seconds).
@@ -171,13 +184,11 @@ public final class MeshRelayService: ObservableObject {
     }
     
     /// Cleanup method to be called before deallocation.
-    /// Since deinit is nonisolated and Timer is not Sendable,
-    /// we must clean up timers from the MainActor context.
     public func cleanup() {
-        topologyBroadcastTimer?.invalidate()
-        topologyBroadcastTimer = nil
-        pruneTimer?.invalidate()
-        pruneTimer = nil
+        topologyBroadcastTask?.cancel()
+        topologyBroadcastTask = nil
+        pruneTask?.cancel()
+        pruneTask = nil
     }
     
     /// Sets the pool manager reference for sending messages.
@@ -568,6 +579,9 @@ public final class MeshRelayService: ObservableObject {
     }
     
     /// Broadcast our topology to all direct neighbors.
+    ///
+    /// When a pool shared secret is configured, the broadcast includes an HMAC
+    /// over the serialized topology data for integrity protection.
     public func broadcastTopology() {
         guard let poolManager = poolManager else { return }
 
@@ -583,11 +597,20 @@ public final class MeshRelayService: ObservableObject {
             return
         }
 
-        // Create topology broadcast message
+        // Compute HMAC over topology data if shared secret is available
+        var hmac: Data? = nil
+        if let sharedSecret = poolSharedSecret, let poolID = currentPoolID {
+            let hmacKey = RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID)
+            let tag = HMAC<SHA256>.authenticationCode(for: broadcastData, using: hmacKey)
+            hmac = Data(tag)
+        }
+
+        // Create topology broadcast message with optional HMAC
         let message = PoolMessage.topologyBroadcast(
             from: localPeerID,
             senderName: poolManager.localPeerName,
-            payload: broadcastData
+            payload: broadcastData,
+            hmac: hmac
         )
 
         log("[CALLER_TRACE] MeshRelayService.broadcastTopology() sending topology with \(directNeighbors.count) neighbors", category: .network)
@@ -604,13 +627,42 @@ public final class MeshRelayService: ObservableObject {
     /// The `senderID` field in `PoolMessage` is set by the MC session delegate based on
     /// the transport-level peer identity, not self-reported by the sender in the payload.
     ///
+    /// When a pool shared secret is configured, the HMAC on the topology broadcast
+    /// is verified before processing. Broadcasts with invalid or missing HMACs are dropped.
+    ///
     /// - Parameter message: The received pool message.
     public func processSystemMessage(_ message: PoolMessage) {
         guard message.type == .system else { return }
 
-        if let topologyBroadcast = TopologyBroadcastWrapper.unwrap(message.payload) {
-            handleTopologyBroadcast(topologyBroadcast, from: message.senderID)
+        guard let result = TopologyBroadcastWrapper.unwrapWithHMAC(message.payload) else {
+            return
         }
+
+        let (topologyBroadcast, topologyData, receivedHMAC) = result
+
+        // Verify HMAC integrity when shared secret is available
+        if let sharedSecret = poolSharedSecret, let poolID = currentPoolID {
+            let hmacKey = RelayEnvelope.deriveHMACKey(from: sharedSecret, poolID: poolID)
+            guard let hmacData = receivedHMAC else {
+                // No HMAC present — reject when shared secret is set.
+                log("[SECURITY] Dropping topology broadcast from \(message.senderID.prefix(8))...: missing HMAC (unsigned)",
+                    level: .warning, category: .network)
+                return
+            }
+            // HMAC present — verify it
+            let isValid = HMAC<SHA256>.isValidAuthenticationCode(
+                hmacData,
+                authenticating: topologyData,
+                using: hmacKey
+            )
+            if !isValid {
+                log("[SECURITY] Dropping topology broadcast from \(message.senderID.prefix(8))...: HMAC verification failed (tampered)",
+                    level: .warning, category: .network)
+                return
+            }
+        }
+
+        handleTopologyBroadcast(topologyBroadcast, from: message.senderID)
     }
     
     /// Check if peer is reachable (directly or via relay).
@@ -698,35 +750,42 @@ public final class MeshRelayService: ObservableObject {
     
     private func startTopologyBroadcastTimer() {
         stopTopologyBroadcastTimer()
-        
-        // Use a weak reference to avoid retain cycle
-        topologyBroadcastTimer = Timer.scheduledTimer(
-            withTimeInterval: topologyBroadcastInterval,
-            repeats: true
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.broadcastTopology()
-                self?.topology.pruneStale()
+
+        topologyBroadcastTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(self?.topologyBroadcastInterval ?? 60.0))
+                guard !Task.isCancelled else { break }
+                await MainActor.run { [weak self] in
+                    self?.broadcastTopology()
+                    self?.topology.pruneStale()
+                }
             }
         }
-        
+
         log("Started topology broadcast timer (interval: \(topologyBroadcastInterval)s)", level: .debug, category: .network)
     }
-    
-    private func stopTopologyBroadcastTimer() {
-        topologyBroadcastTimer?.invalidate()
-        topologyBroadcastTimer = nil
-    }
-    
-    private func startPruneTimer() {
-        // Guard against multiple timer starts
-        guard pruneTimer == nil else { return }
 
-        pruneTimer = Timer.scheduledTimer(
-            withTimeInterval: pruneInterval,
-            repeats: true
-        ) { [weak self] _ in
-            self?.deduplicationCache.pruneExpired()
+    private func stopTopologyBroadcastTimer() {
+        topologyBroadcastTask?.cancel()
+        topologyBroadcastTask = nil
+    }
+
+    private func startPruneTimer() {
+        // Guard against multiple task starts
+        guard pruneTask == nil else { return }
+
+        pruneTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(self?.pruneInterval ?? 60.0))
+                guard !Task.isCancelled else { break }
+                self?.deduplicationCache.pruneExpired()
+                // HIGH-002 FIX: Prune stale topology entries in the prune timer
+                // so stale peers are cleaned up even when no pool is active
+                // (the topology broadcast timer only runs while a pool is set).
+                await MainActor.run { [weak self] in
+                    self?.topology.pruneStale()
+                }
+            }
         }
     }
 }
@@ -762,10 +821,11 @@ extension PoolMessage {
     ///   - senderID: The peer ID broadcasting its topology.
     ///   - senderName: The display name of the sender.
     ///   - payload: The JSON-encoded `TopologyBroadcast` data.
+    ///   - hmac: Optional HMAC-SHA256 over the payload for integrity protection.
     /// - Returns: A configured `PoolMessage` with type `.system`.
-    static func topologyBroadcast(from senderID: String, senderName: String, payload: Data) -> PoolMessage {
+    static func topologyBroadcast(from senderID: String, senderName: String, payload: Data, hmac: Data? = nil) -> PoolMessage {
         // Use system message type with a topology broadcast payload wrapper
-        let wrapper = TopologyBroadcastWrapper(topologyData: payload)
+        let wrapper = TopologyBroadcastWrapper(topologyData: payload, topologyHMAC: hmac)
         let wrappedData = (try? JSONEncoder().encode(wrapper)) ?? payload
         return PoolMessage(
             type: .system,
@@ -808,6 +868,16 @@ struct TopologyBroadcastWrapper: Codable, Sendable {
     /// The encoded `TopologyBroadcast` data.
     let topologyData: Data
 
+    /// Optional HMAC-SHA256 over `topologyData` for integrity protection.
+    /// When present, receivers with a pool shared secret MUST verify the HMAC
+    /// before processing the topology update.
+    let topologyHMAC: Data?
+
+    init(topologyData: Data, topologyHMAC: Data? = nil) {
+        self.topologyData = topologyData
+        self.topologyHMAC = topologyHMAC
+    }
+
     /// Checks if a payload is a topology broadcast wrapper.
     /// - Parameter data: The data to check.
     /// - Returns: The unwrapped `TopologyBroadcast` if this is a topology message, `nil` otherwise.
@@ -817,5 +887,22 @@ struct TopologyBroadcastWrapper: Codable, Sendable {
             return nil
         }
         return try? JSONDecoder().decode(TopologyBroadcast.self, from: wrapper.topologyData)
+    }
+
+    /// Unwraps a topology broadcast with its raw topology data and optional HMAC.
+    ///
+    /// Returns a tuple of (decoded broadcast, raw topology data for HMAC verification, optional HMAC).
+    /// The raw topology data is needed because the HMAC is computed over the exact encoded bytes,
+    /// not over a re-encoded copy.
+    ///
+    /// - Parameter data: The wrapper payload to decode.
+    /// - Returns: A tuple of (broadcast, topologyData, hmac), or `nil` if not a topology message.
+    static func unwrapWithHMAC(_ data: Data) -> (TopologyBroadcast, Data, Data?)? {
+        guard let wrapper = try? JSONDecoder().decode(TopologyBroadcastWrapper.self, from: data),
+              wrapper.type == "topology_broadcast",
+              let broadcast = try? JSONDecoder().decode(TopologyBroadcast.self, from: wrapper.topologyData) else {
+            return nil
+        }
+        return (broadcast, wrapper.topologyData, wrapper.topologyHMAC)
     }
 }

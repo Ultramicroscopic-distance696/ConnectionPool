@@ -4,6 +4,7 @@
 import XCTest
 @testable import ConnectionPool
 
+@MainActor
 final class RemotePoolStateTests: XCTestCase {
 
     override func tearDown() {
@@ -93,5 +94,50 @@ final class RemotePoolStateTests: XCTestCase {
         let loaded = RemotePoolState.load()
         XCTAssertEqual(loaded?.serverURL, "ws://second")
         XCTAssertEqual(loaded?.poolName, "Second")
+    }
+
+    func testSecureProviderIsUsedWhenConfigured() {
+        // Create a mock storage provider
+        let mockProvider = MockStorageProvider()
+        ConnectionPoolConfiguration.remotePoolStateStorageProvider = mockProvider
+
+        let poolID = UUID()
+        let state = RemotePoolState(
+            serverURL: "ws://secure-test",
+            poolName: "SecurePool",
+            isClaimed: true,
+            poolID: poolID,
+            maxPeers: 4,
+            isHost: true
+        )
+        state.save()
+
+        // Verify it was saved through the provider, not UserDefaults
+        XCTAssertNotNil(mockProvider.storage["remote_pool_state"])
+        XCTAssertNil(UserDefaults.standard.data(forKey: "remote_pool_state"))
+
+        // Verify it loads back through the provider
+        let loaded = RemotePoolState.load()
+        XCTAssertNotNil(loaded)
+        XCTAssertEqual(loaded?.serverURL, "ws://secure-test")
+        XCTAssertEqual(loaded?.poolID, poolID)
+
+        // Clean up
+        ConnectionPoolConfiguration.remotePoolStateStorageProvider = nil
+    }
+
+}
+
+// MARK: - Mock Storage Provider
+
+private final class MockStorageProvider: BlockListStorageProvider, @unchecked Sendable {
+    var storage: [String: Data] = [:]
+
+    func save(_ data: Data, forKey key: String) throws {
+        storage[key] = data
+    }
+
+    func load(forKey key: String) throws -> Data? {
+        storage[key]
     }
 }
