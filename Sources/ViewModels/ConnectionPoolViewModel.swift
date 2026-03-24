@@ -73,6 +73,11 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
     @Published public var invitationURLInput: String = ""
     @Published public var isConnectingRemote: Bool = false
 
+    /// Server URL editing state
+    @Published public var showEditServerURL: Bool = false
+    @Published public var editingServerURL: String = ""
+    @Published public var serverURLUpdateConfirmation: String?
+
     /// Error handling
     @Published public var errorMessage: String?
     @Published public var showError: Bool = false
@@ -677,6 +682,128 @@ public final class ConnectionPoolViewModel: ObservableObject, PoolAppLifecycle {
             transportMode = .local
             webSocketTransport = nil
         }
+    }
+
+    /// Update the relay server URL after the server has been claimed.
+    ///
+    /// This normalizes the URL, persists the change, and if currently connected,
+    /// disconnects and reconnects with the new URL so the relay receives an
+    /// updated `HostAuth` containing the new `server_url` for future invitations.
+    public func updateServerURL(_ newURL: String) {
+        // 1. Normalize
+        var normalized = newURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            showError(message: "Server URL cannot be empty")
+            return
+        }
+
+        if !normalized.hasPrefix("ws://") && !normalized.hasPrefix("wss://") {
+            normalized = "wss://\(normalized)"
+        }
+
+        // Strip trailing slash for consistency
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+
+        guard URL(string: normalized) != nil else {
+            showError(message: "Invalid server URL format")
+            return
+        }
+
+        // No-op if the URL hasn't changed
+        guard normalized != serverURL else {
+            showEditServerURL = false
+            return
+        }
+
+        let previousURL = serverURL
+
+        // 2. Update in-memory state
+        serverURL = normalized
+
+        // 3. Update persisted state
+        if var state = RemotePoolState.load() {
+            state.serverURL = normalized
+            state.save()
+        }
+
+        // 4. If connected, disconnect and reconnect with the new URL.
+        //    The reconnect reuses the existing poolID and claim state.
+        if transportMode == .remote, let poolID = remotePoolID {
+            log("Server URL changed from \(previousURL) to \(normalized), reconnecting...", category: .network)
+
+            // Tear down old transport
+            webSocketTransport?.disconnect()
+            webSocketTransport = nil
+            poolManager.remoteTransport = nil
+            poolManager.remotePeerID = nil
+
+            // Build new transport with updated URL
+            guard let url = URL(string: normalized) else { return }
+            let name = poolName.isEmpty ? "\(poolManager.localProfile.displayName)'s Pool" : poolName
+            let config = RemotePoolConfiguration(
+                serverURL: url,
+                poolName: name,
+                maxPeers: maxPeers
+            )
+
+            let transport = WebSocketTransport(
+                configuration: config,
+                displayName: poolManager.localProfile.displayName
+            )
+            transport.delegate = self
+            webSocketTransport = transport
+
+            do {
+                let identity = try remotePoolService.getOrCreateHostIdentity()
+                let poolInfo = PoolAdvertisementInfo(
+                    poolID: poolID,
+                    poolName: name,
+                    hostName: poolManager.localProfile.displayName,
+                    hasPoolCode: false,
+                    maxPeers: maxPeers,
+                    hostProfile: poolManager.localProfile
+                )
+                transport.startAdvertising(poolInfo: poolInfo)
+                isHost = true
+                poolState = .connecting
+                isConnectingRemote = true
+                _ = identity
+            } catch {
+                showError(message: "Failed to reconnect: \(error.localizedDescription)")
+                // Revert URL on failure
+                serverURL = previousURL
+                if var state = RemotePoolState.load() {
+                    state.serverURL = previousURL
+                    state.save()
+                }
+                return
+            }
+        }
+
+        showEditServerURL = false
+
+        // Show brief confirmation
+        serverURLUpdateConfirmation = "Server URL updated"
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            if self?.serverURLUpdateConfirmation == "Server URL updated" {
+                self?.serverURLUpdateConfirmation = nil
+            }
+        }
+    }
+
+    /// Begin editing the server URL. Pre-fills the editing field with the current URL.
+    public func startEditingServerURL() {
+        editingServerURL = serverURL
+        showEditServerURL = true
+    }
+
+    /// Begin editing the server URL from a saved state (home screen card).
+    public func startEditingServerURL(from savedURL: String) {
+        editingServerURL = savedURL
+        showEditServerURL = true
     }
 
     /// Submit the claim code to bind this device as the server's host.

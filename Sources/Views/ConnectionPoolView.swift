@@ -324,6 +324,16 @@ private struct HomeView: View {
                             }
                             .buttonStyle(.plain)
 
+                            Button {
+                                viewModel.startEditingServerURL(from: saved.serverURL)
+                            } label: {
+                                Image(systemName: "pencil")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.blue)
+                                    .padding(8)
+                            }
+                            .buttonStyle(.plain)
+
                             Button(role: .destructive) {
                                 showDeleteServerAlert = true
                             } label: {
@@ -382,6 +392,18 @@ private struct HomeView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This will remove the saved relay server. You can re-add it later by claiming the server again.")
+        }
+        .alert("Edit Server URL", isPresented: $viewModel.showEditServerURL) {
+            TextField("wss://relay.example.com", text: $viewModel.editingServerURL)
+                .crossPlatformTextField()
+            Button("Save") {
+                viewModel.updateServerURL(viewModel.editingServerURL)
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.showEditServerURL = false
+            }
+        } message: {
+            Text("Enter the new relay server URL. Use your tunnel URL (wss://) so friends outside your network can connect.")
         }
         .crossPlatformNavigationBarHidden(true)
         .sheet(isPresented: $showRemoteHostSheet) {
@@ -641,6 +663,11 @@ private struct PoolLobbyView: View {
                         // Connection Status
                         ConnectionStatusCard(viewModel: viewModel)
 
+                        // Server URL Card (remote mode, host only)
+                        if viewModel.transportMode == .remote && viewModel.isHost {
+                            ServerURLCard(viewModel: viewModel)
+                        }
+
                         // Pending Invitations (for host)
                         if viewModel.isHost && !viewModel.pendingInvitations.isEmpty {
                             PendingInvitationsCard(viewModel: viewModel)
@@ -666,6 +693,18 @@ private struct PoolLobbyView: View {
         }
         .sheet(isPresented: $viewModel.showInvitationShareSheet) {
             InvitationShareSheet(viewModel: viewModel)
+        }
+        .alert("Edit Server URL", isPresented: $viewModel.showEditServerURL) {
+            TextField("wss://relay.example.com", text: $viewModel.editingServerURL)
+                .crossPlatformTextField()
+            Button("Save") {
+                viewModel.updateServerURL(viewModel.editingServerURL)
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.showEditServerURL = false
+            }
+        } message: {
+            Text("Enter the new relay server URL. Use your tunnel URL (wss://) so friends outside your network can connect.")
         }
     }
 
@@ -879,6 +918,61 @@ private struct PoolCodeCard: View {
         .padding()
         .background(Color.systemGray6Color)
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - Server URL Card
+
+private struct ServerURLCard: View {
+    @ObservedObject var viewModel: ConnectionPoolViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "server.rack")
+                    .foregroundStyle(.blue)
+                Text("Relay Server")
+                    .font(.subheadline.bold())
+                Spacer()
+                Button {
+                    viewModel.startEditingServerURL()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "pencil")
+                        Text("Edit")
+                    }
+                    .font(.caption.bold())
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.blue.opacity(0.1))
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text(viewModel.serverURL)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            if let confirmation = viewModel.serverURLUpdateConfirmation {
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text(confirmation)
+                        .foregroundStyle(.green)
+                }
+                .font(.caption)
+                .transition(.opacity)
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.systemGray6Color)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .animation(.easeInOut(duration: 0.3), value: viewModel.serverURLUpdateConfirmation)
     }
 }
 
