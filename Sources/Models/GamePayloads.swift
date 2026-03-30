@@ -14,6 +14,7 @@ public enum MultiplayerGameType: String, Codable, Sendable, CaseIterable {
     case connectFour = "connect_four"
     case promptParty = "prompt_party"
     case chess = "chess"
+    case ludo = "ludo"
 
     public var displayName: String {
         switch self {
@@ -21,6 +22,7 @@ public enum MultiplayerGameType: String, Codable, Sendable, CaseIterable {
         case .connectFour: return "Connect Four"
         case .promptParty: return "Prompt Party"
         case .chess: return "Chess"
+        case .ludo: return "Ludo"
         }
     }
 
@@ -30,6 +32,7 @@ public enum MultiplayerGameType: String, Codable, Sendable, CaseIterable {
         case .connectFour: return "circle.grid.3x3.fill"
         case .promptParty: return "bubble.left.and.bubble.right.fill"
         case .chess: return "crown.fill"
+        case .ludo: return "dice.fill"
         }
     }
 
@@ -39,6 +42,7 @@ public enum MultiplayerGameType: String, Codable, Sendable, CaseIterable {
         case .connectFour: return 2     // Classic 2-player game
         case .promptParty: return 8     // Party game supports up to 8
         case .chess: return 2           // Classic 2-player game
+        case .ludo: return 4            // Classic 4-player game
         }
     }
 
@@ -46,6 +50,7 @@ public enum MultiplayerGameType: String, Codable, Sendable, CaseIterable {
         switch self {
         case .chainReaction, .connectFour, .chess: return 2
         case .promptParty: return 2  // Party game can work with 2 players
+        case .ludo: return 2           // Ludo can work with 2 players
         }
     }
 }

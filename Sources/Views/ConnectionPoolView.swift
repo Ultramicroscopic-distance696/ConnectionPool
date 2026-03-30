@@ -1535,6 +1535,18 @@ private struct GamesSelectionSheet: View {
                         viewModel.openGame(.promptParty)
                         dismiss()
                     }
+
+                    // Ludo
+                    GameSelectionRow(
+                        title: "Ludo",
+                        subtitle: "Classic board game with dice rolling",
+                        icon: "dice.fill",
+                        color: .green,
+                        players: "2-4 players"
+                    ) {
+                        viewModel.openGame(.ludo)
+                        dismiss()
+                    }
                 }
                 .padding(.horizontal)
 
